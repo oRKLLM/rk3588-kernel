@@ -15,4 +15,8 @@ int rknpu_reset_get(struct rknpu_device *rknpu_dev);
 
 int rknpu_soft_reset(struct rknpu_device *rknpu_dev);
 
+int rknpu_soft_reset_core(struct rknpu_device *rknpu_dev, int core);
+
+int rknpu_reset_core_and_remap(struct rknpu_device *rknpu_dev, int core);
+
 #endif

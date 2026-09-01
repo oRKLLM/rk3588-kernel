@@ -1,3 +1,4 @@
+/* #patch40: the wd_kick auto-recovery was deleted -- see the note in rknpu_drv.c. */
 // SPDX-License-Identifier: GPL-2.0
 /*
  * Copyright (C) Rockchip Electronics Co., Ltd.
@@ -15,8 +16,92 @@
 #include "rknpu_gem.h"
 #include "rknpu_fence.h"
 #include "rknpu_mem.h"
+#include <linux/iommu.h>
 #include "rknpu_iommu.h"
 #include "rknpu_job.h"
+
+/* #patch66: UNMASK the bits the hardware sets when a job fails to dispatch.
+ *
+ * Comparing the PC block for a healthy job against a stalled one, the one register that differs is
+ * INT_RAW_STATUS (0x2c): 0x00000008 healthy, 0xc0000000 stalled — bits 30 and 31 latched. INT_MASK is
+ * 0x300 and does not cover them, so the NPU detects the condition, records it, and delivers no
+ * interrupt. Everything else in the block is identical and correct at the stall (PC_DATA_ADDR holds
+ * the regcmd IOVA, the 0x6 trigger has been consumed, INT_STATUS is 0).
+ *
+ * Setting this ORs extra bits into INT_MASK so the condition can actually be delivered. Two hazards
+ * handled here:
+ *   - RKNPU_INT_CLEAR is 0x1ffff, i.e. bits 0..16 only, so the new bits would NOT be clearable and a
+ *     level-triggered source would storm forever. The same extra bits are therefore OR'd into every
+ *     INT_CLEAR write as well.
+ *   - if it storms anyway, the guard below disarms itself rather than hanging the board.
+ *
+ * 0 = off (default). Try 0xc0000000. */
+unsigned int rknpu_int_mask_extra;
+module_param_named(int_mask_extra, rknpu_int_mask_extra, uint, 0644);
+MODULE_PARM_DESC(int_mask_extra, "OR these bits into INT_MASK/INT_CLEAR (0=off; try 0xc0000000)");
+unsigned long rknpu_int_extra_fired;
+module_param_named(int_extra_fired, rknpu_int_extra_fired, ulong, 0444);
+
+/* #patch47 */
+ktime_t rknpu_prof_last_commit[3];
+/* #patch48 */
+extern unsigned long rknpu_prof_ok_n, rknpu_prof_ok_gap, rknpu_prof_ok_queue;
+/* #patch49 */
+extern unsigned long rknpu_gap_enforced_n, rknpu_gap_enforced_us;
+unsigned int rknpu_min_commit_gap_get(void);
+unsigned int rknpu_prof_mask_get(void);   /* #patch50 */
+extern unsigned int rknpu_commits_since_switch;   /* #patch51 */
+extern ktime_t rknpu_last_switch_time;   /* #patch52 */
+
+
+
+/* #patch (experiment): does the QUEUE stall behind a lost completion interrupt?
+ * rknpu_job_next() only runs from the completion path, so a lost IRQ leaves subcore_data->job
+ * set and the next submit sits on todo_list, never committed -> PC never starts -> the
+ * "accepted but never dispatched" doorbell miss. A deficit of completions vs commits proves it.
+ *   commit  = rknpu_job_subcore_commit() calls  (jobs actually handed to the PC)
+ *   irq     = rknpu_irq_handler() entries       (interrupts that reached the handler)
+ *   nojob   = handler found no job              (spurious / already-reaped)
+ *   unpow   = handler declined, block unpowered (Change 6 guard)
+ *   done    = rknpu_job_done() final completion (interrupt_count reached 0)
+ * Healthy steady state: commit == done, and irq >= commit. */
+static unsigned int rknpu_dbg_healthy_n;
+/* #patchB7: catch a BLOCKING submit that reports success for a job that never completed.
+ * Measured contradiction: the first int8 op after an ACT_RESET has every one of its submits
+ * committed with NONE completing (cnt_done/cnt_irq do not move), yet the ioctl returns 0 and
+ * userspace consumes an unwritten output buffer. Only one site sets RKNPU_JOB_DONE and it
+ * increments cnt_done in the same block, so a success return without JOB_DONE is a real leak.
+ * Record it and name the flags -- in particular whether RKNPU_JOB_PC was set, since the blocking
+ * path only calls rknpu_job_wait() when it is. */
+unsigned long rknpu_dbg_false_ok;
+module_param_named(dbg_false_ok, rknpu_dbg_false_ok, ulong, 0444);
+unsigned long rknpu_dbg_nopc;
+module_param_named(dbg_nopc, rknpu_dbg_nopc, ulong, 0444);   /* #patch: matched-control samples logged */
+/* #patchB4: which task_ctrl signature the HEALTHY control samples. The control MUST match the
+ * stalled job's signature or the comparison is meaningless -- a 1-task pp-on stall (0x7001)
+ * compared against a 2-task pp-on success (0x7002) tells you nothing. Made a live param so the
+ * control can be re-aimed at whatever signature is actually stalling, without a rebuild. */
+unsigned int rknpu_dbg_healthy_ctrl = 0x7001;
+module_param_named(dbg_healthy_ctrl, rknpu_dbg_healthy_ctrl, uint, 0644);
+/* #patch: how often rknpu_job_timeout_clean SOFT-RESETS the NPU and drops the RUNNING job.
+ * It compares ktime_us_delta(now, job->timestamp) >= args->timeout -- MICROseconds against a value every
+ * other site treats as MILLIseconds -- so our 1500 ("ms") is really a 1.5 ms threshold while our jobs run
+ * a median 5.7 ms. Any job still executing when the next submit lands on its core is therefore older than
+ * the threshold, gets the whole NPU reset under it, and is dropped: committed, never completed, no
+ * interrupt. That predicts commit-done == stall count, which is what we measure.
+ *   treap     = timeout_clean reset+dropped a job
+ *   treap_age = age (us) of the job it killed, last occurrence */
+static unsigned long rknpu_cnt_treap;
+static unsigned long rknpu_cnt_treap_age;
+module_param_named(cnt_treap, rknpu_cnt_treap, ulong, 0444);
+module_param_named(cnt_treap_age, rknpu_cnt_treap_age, ulong, 0444);
+static unsigned long rknpu_cnt_commit, rknpu_cnt_irq, rknpu_cnt_nojob,
+                     rknpu_cnt_unpow, rknpu_cnt_done;
+module_param_named(cnt_commit, rknpu_cnt_commit, ulong, 0444);
+module_param_named(cnt_irq,    rknpu_cnt_irq,    ulong, 0444);
+module_param_named(cnt_nojob,  rknpu_cnt_nojob,  ulong, 0444);
+module_param_named(cnt_unpow,  rknpu_cnt_unpow,  ulong, 0444);
+module_param_named(cnt_done,   rknpu_cnt_done,   ulong, 0444);
 
 #define _REG_READ(base, offset) readl(base + (offset))
 #define _REG_WRITE(base, value, offset) writel(value, base + (offset))
@@ -101,8 +186,20 @@ static void rknpu_job_free(struct rknpu_job *job)
 		rknpu_gem_object_put(&task_obj->base);
 #endif
 
-	if (job->fence)
+	if (job->fence) {
+		/* #patch: a job torn down WITHOUT completing (rknpu_job_timeout_clean /
+		 * rknpu_job_abort) never reaches the RKNPU_JOB_DONE path, so its fence is
+		 * never signalled and every waiter blocks until its OWN timeout expires --
+		 * which defeats the point of waiting on a fence to detect a stalled job.
+		 * Signal it with an error instead, so a waiter wakes immediately and can
+		 * tell a stall from a completion via dma_fence_get_status(). No-op on the
+		 * success path, where the completion IRQ already signalled it. */
+		if (!dma_fence_is_signaled(job->fence)) {
+			dma_fence_set_error(job->fence, -ETIMEDOUT);
+			dma_fence_signal(job->fence);
+		}
 		dma_fence_put(job->fence);
+	}
 
 	if (job->args_owner)
 		kfree(job->args);
@@ -135,6 +232,18 @@ static inline struct rknpu_job *rknpu_job_alloc(struct rknpu_device *rknpu_dev,
 #endif
 
 	job = kzalloc(sizeof(*job), GFP_KERNEL);
+	if (job) {
+		/* #patch67: head[] must be a valid empty node from the moment
+		 * the job exists. kzalloc leaves it {NULL,NULL}, and
+		 * rknpu_job_schedule() can bail before queueing (a failed
+		 * domain switch sets job->ret and returns) yet still reach
+		 * rknpu_job_abort() -- where the unlink above would then be a
+		 * NULL deref instead of a no-op. */
+		int c;
+
+		for (c = 0; c < RKNPU_MAX_CORES; c++)
+			INIT_LIST_HEAD(&job->head[c]);
+	}
 	if (!job)
 		return NULL;
 
@@ -192,9 +301,20 @@ static inline int rknpu_job_wait(struct rknpu_job *job)
 
 	do {
 		ret = wait_event_timeout(subcore_data->job_done_wq,
-					 job->flags & RKNPU_JOB_DONE ||
+					 job->flags & (RKNPU_JOB_DONE |
+						       RKNPU_JOB_STALLED) ||
 						 rknpu_dev->soft_reseting,
 					 msecs_to_jiffies(args->timeout));
+
+		/* #patch41 (fast-abort): the watchdog woke us because this job has made no
+		 * progress. Force ret=0 and leave the retry loop so we fall into the SAME
+		 * `if (ret <= 0)` path a natural timeout takes -- it samples the PC counter,
+		 * logs, and returns -ETIMEDOUT. Identical outcome to the old behaviour, just
+		 * without waiting args->timeout x 3 for it (measured: 60.6 s). */
+		if (job->flags & RKNPU_JOB_STALLED) {
+			ret = 0;
+			break;
+		}
 
 		if (++wait_count >= 3)
 			break;
@@ -294,6 +414,8 @@ static inline int rknpu_job_subcore_commit_pc(struct rknpu_job *job,
 	int pc_task_number_bits = rknpu_dev->config->pc_task_number_bits;
 	int i = 0;
 	int submit_index = atomic_read(&job->submit_count[core_index]);
+
+	rknpu_cnt_commit++;   /* #patch */
 	int max_submit_number = rknpu_dev->config->max_submit_number;
 	unsigned long flags;
 
@@ -355,9 +477,11 @@ static inline int rknpu_job_subcore_commit_pc(struct rknpu_job *job,
 			  1,
 		  RKNPU_OFFSET_PC_DATA_AMOUNT);
 
-	REG_WRITE(last_task->int_mask, RKNPU_OFFSET_INT_MASK);
+	REG_WRITE(last_task->int_mask | rknpu_int_mask_extra,   /* #patch66 */
+		  RKNPU_OFFSET_INT_MASK);
 
-	REG_WRITE(first_task->int_mask, RKNPU_OFFSET_INT_CLEAR);
+	REG_WRITE(first_task->int_mask | rknpu_int_mask_extra,  /* #patch66 */
+		  RKNPU_OFFSET_INT_CLEAR);
 
 	REG_WRITE(((0x6 | task_pp_en) << pc_task_number_bits) | task_number,
 		  RKNPU_OFFSET_PC_TASK_CONTROL);
@@ -368,8 +492,41 @@ static inline int rknpu_job_subcore_commit_pc(struct rknpu_job *job,
 	job->last_task = last_task;
 	job->int_mask[core_index] = last_task->int_mask;
 
+	/* #patch: snapshot what we WROTE vs what reads BACK, before and after the start pulse.
+	 * Distinguishes "the write never landed" (readback zero/garbage -> ordering, barrier or
+	 * gated clocks) from "it landed and the PC ignored it" (hardware state machine). */
+	job->dbg_wr[0] = first_task->regcmd_addr;
+	job->dbg_wr[1] = (first_task->regcfg_amount + RKNPU_PC_DATA_EXTRA_AMOUNT +
+			  pc_data_amount_scale - 1) / pc_data_amount_scale - 1;
+	job->dbg_wr[2] = last_task->int_mask;
+	job->dbg_wr[3] = ((0x6 | task_pp_en) << pc_task_number_bits) | task_number;
+	job->dbg_wr[4] = (uint32_t)args->task_base_addr;
+	job->dbg_wr[5] = task_number;
+	/* #patch: the sequence userspace stamped into this descriptor (rknpu_task.op_idx, a field the
+	 * driver otherwise ignores). If a STALLED commit reports an OLDER stamp than the ones healthy
+	 * commits are reporting, the kernel read a STALE task array through its kernel mapping. */
+	job->dbg_seq = first_task->op_idx;
+	job->dbg_rd[0] = REG_READ(RKNPU_OFFSET_PC_DATA_ADDR);
+	job->dbg_rd[1] = REG_READ(RKNPU_OFFSET_PC_DATA_AMOUNT);
+	job->dbg_rd[2] = REG_READ(RKNPU_OFFSET_INT_MASK);
+	job->dbg_rd[3] = REG_READ(RKNPU_OFFSET_PC_TASK_CONTROL);
+	job->dbg_rd[4] = REG_READ(RKNPU_OFFSET_PC_DMA_BASE_ADDR);
+	job->dbg_rd[5] = REG_READ(rknpu_dev->config->pc_task_status_offset);
+
 	REG_WRITE(0x1, RKNPU_OFFSET_PC_OP_EN);
 	REG_WRITE(0x0, RKNPU_OFFSET_PC_OP_EN);
+
+	job->dbg_rd[6] = REG_READ(rknpu_dev->config->pc_task_status_offset);
+	/* #patch: full PC/INT block AFTER the start pulse. Map (vendor rknpu_ioctl.h):
+	 *   0x00 VERSION      0x04 VERSION_NUM  0x08 PC_OP_EN     0x10 PC_DATA_ADDR
+	 *   0x14 PC_DATA_AMT  0x20 INT_MASK     0x24 INT_CLEAR    0x28 INT_STATUS
+	 *   0x2c INT_RAW      0x30 PC_TASK_CTRL 0x34 PC_DMA_BASE  0x3c PC_TASK_STATUS
+	 * plus ENABLE_MASK at 0xf008. Everything we WRITE is already verified identical between a
+	 * healthy and a stalled commit; this samples the registers we do NOT write, to see whether the
+	 * PC's own state differs. If nothing differs, the fault is not visible at this level. */
+	{ int _i; for (_i = 0; _i < 16; _i++) job->dbg_blk[_i] = REG_READ(_i * 4);
+	  job->dbg_blk[16] = REG_READ(RKNPU_OFFSET_ENABLE_MASK); }
+	job->dbg_valid = true;
 
 	return 0;
 }
@@ -426,6 +583,7 @@ static void rknpu_job_commit(struct rknpu_job *job)
 	}
 }
 
+
 static void rknpu_job_next(struct rknpu_device *rknpu_dev, int core_index)
 {
 	struct rknpu_job *job = NULL;
@@ -450,8 +608,51 @@ static void rknpu_job_next(struct rknpu_device *rknpu_dev, int core_index)
 	list_del_init(&job->head[core_index]);
 	subcore_data->job = job;
 	job->hw_commit_time = ktime_get();
+	/* #patch47 (profiler): record the gap since the PREVIOUS commit on this core, so a stalled
+	 * job's timeline can be compared against a healthy one's. Two questions this answers:
+	 * does a stall correlate with back-to-back commits (too little settle between jobs), or
+	 * with a long queue delay (submit -> commit)? Both are free here -- job->timestamp and
+	 * hw_commit_time already exist; only the per-core previous-commit time is new. */
+	job->prof_gap_us = rknpu_prof_last_commit[core_index] ?
+		ktime_us_delta(job->hw_commit_time,
+			       rknpu_prof_last_commit[core_index]) : 0;
+	job->prof_queue_us = ktime_us_delta(job->hw_commit_time, job->timestamp);
+	rknpu_prof_last_commit[core_index] = job->hw_commit_time;
 	job->hw_recoder_time = job->hw_commit_time;
 	spin_unlock_irqrestore(&rknpu_dev->irq_lock, flags);
+
+	/* #patch50: shape axis. The timing hypothesis failed its causal test (enforcing spacing
+	 * gave no dose-response and inverted at 1500us), so the working theory is that a short gap
+	 * is a SYMPTOM of which op is running. Log the shape of every commit so the stalled and
+	 * healthy shape distributions can be compared directly. */
+	job->prof_since_switch = rknpu_commits_since_switch++;   /* #patch51 */
+	job->prof_tsince_us = rknpu_last_switch_time ?   /* #patch52 */
+		ktime_us_delta(job->hw_commit_time, rknpu_last_switch_time) : -1;
+	if (rknpu_prof_mask_get() & 2)
+		LOG_ERROR("RKNPU: PROF commit core=%d tn=%u cm=%#x dom=%d sinceswitch=%u tsince=%lldus gap=%lldus\n",
+			  core_index, job->args->task_number,
+			  job->args->core_mask, job->iommu_domain_id,
+			  job->prof_since_switch, job->prof_tsince_us, job->prof_gap_us);
+
+	/* #patch49: enforce a minimum spacing between commits on this core.
+	 *
+	 * Placed here so the enforcement matches where #patch47 MEASURES the gap -- same path, same
+	 * core, apples to apples. udelay() not usleep_range(): this can be reached from the
+	 * completion IRQ. Clamped, and skipped entirely when the knob is 0. */
+	{
+		unsigned int minus = rknpu_min_commit_gap_get();
+
+		if (minus && job->prof_gap_us >= 0 &&
+		    job->prof_gap_us < (s64)minus) {
+			unsigned int need = minus - (unsigned int)job->prof_gap_us;
+
+			if (need > 5000)
+				need = 5000;
+			udelay(need);
+			rknpu_gap_enforced_n++;
+			rknpu_gap_enforced_us += need;
+		}
+	}
 
 	if (atomic_dec_and_test(&job->run_count))
 		rknpu_job_commit(job);
@@ -485,9 +686,50 @@ static void rknpu_job_done(struct rknpu_job *job, int ret, int core_index)
 	if (atomic_dec_and_test(&job->interrupt_count)) {
 		int use_core_num = job->use_core_num;
 
-		rknpu_iommu_domain_put(rknpu_dev);
+		rknpu_cnt_done++;   /* #patch */
+		if (job->dbg_kick_t)
+			LOG_ERROR("RKNPU:   KICKED JOB COMPLETED %lldus after the kick\n",
+				  ktime_us_delta(ktime_get(), job->dbg_kick_t));
+
+		/* #patch (experiment control): dump a SUCCESSFUL job's commit snapshot every 2000th
+		 * completion, so the stalled-job dump has a same-run baseline to compare against.
+		 * Without this the stalled readback is uninterpretable — we cannot tell an abnormal
+		 * value from simply how the register reads back. */
+		/* MATCHED control: only sample successful jobs with the SAME signature as the stalled
+		 * ones (task_ctrl 0x7002 = ping-pong on, 2 tasks). An unmatched control compared a
+		 * 1-task pp-off job against a 2-task pp-on stall and was uninterpretable. */
+		/* Log the FIRST few matching successes, never a modulo. Sampling every 500th
+		 * completion aliased: the workload repeats a 4-job cycle (one real 0x7002 op plus
+		 * three 0x6001 drain dummies) and 500 %% 4 == 0, so the sampler locked to one phase
+		 * and captured ZERO matching jobs. */
+		if (job->dbg_valid && job->dbg_wr[3] == rknpu_dbg_healthy_ctrl &&
+	    rknpu_dbg_healthy_n < 3 &&
+		    ++rknpu_dbg_healthy_n) {
+			LOG_ERROR("RKNPU: HEALTHY commit snapshot: WROTE data_addr=%#x amount=%#x int_mask=%#x task_ctrl=%#x dma_base=%#x tasks=%u | READBACK data_addr=%#x amount=%#x int_mask=%#x task_ctrl=%#x dma_base=%#x status(pre)=%#x status(post)=%#x\n",
+				  job->dbg_wr[0], job->dbg_wr[1], job->dbg_wr[2],
+				  job->dbg_wr[3], job->dbg_wr[4], job->dbg_wr[5],
+				  job->dbg_rd[0], job->dbg_rd[1], job->dbg_rd[2],
+				  job->dbg_rd[3], job->dbg_rd[4], job->dbg_rd[5],
+				  job->dbg_rd[6]);
+			LOG_ERROR("RKNPU: HEALTHY PCBLK %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x | en=%08x\n",
+				  job->dbg_blk[0], job->dbg_blk[1], job->dbg_blk[2], job->dbg_blk[3],
+				  job->dbg_blk[4], job->dbg_blk[5], job->dbg_blk[6], job->dbg_blk[7],
+				  job->dbg_blk[8], job->dbg_blk[9], job->dbg_blk[10], job->dbg_blk[11],
+				  job->dbg_blk[12], job->dbg_blk[13], job->dbg_blk[14], job->dbg_blk[15],
+				  job->dbg_blk[16]);
+		}
+
+		if (test_and_clear_bit(0, &job->dom_held))   /* #patch64 */
+			rknpu_iommu_domain_put(rknpu_dev);
 
 		job->flags |= RKNPU_JOB_DONE;
+		/* #patch48: healthy baseline for the profiler — same two quantities the stall path
+		 * records, so the comparison is like-for-like. */
+		if (!(job->flags & RKNPU_JOB_STALLED)) {
+			rknpu_prof_ok_n++;
+			rknpu_prof_ok_gap += (unsigned long)job->prof_gap_us;
+			rknpu_prof_ok_queue += (unsigned long)job->prof_queue_us;
+		}
 		job->ret = ret;
 
 		if (job->fence)
@@ -541,6 +783,8 @@ static void rknpu_job_schedule(struct rknpu_job *job)
 		job->ret = -EINVAL;
 		return;
 	}
+	/* #patch64: this job now OWNS a domain reference. Exactly one release may act on it. */
+	set_bit(0, &job->dom_held);
 
 	spin_lock_irqsave(&rknpu_dev->irq_lock, flags);
 	for (i = 0; i < rknpu_dev->config->num_irqs; i++) {
@@ -565,7 +809,8 @@ static void rknpu_job_abort(struct rknpu_job *job)
 	unsigned long flags;
 	int i = 0;
 
-	rknpu_iommu_domain_put(rknpu_dev);
+	if (test_and_clear_bit(0, &job->dom_held))   /* #patch64 */
+		rknpu_iommu_domain_put(rknpu_dev);
 
 	msleep(100);
 
@@ -573,11 +818,47 @@ static void rknpu_job_abort(struct rknpu_job *job)
 	for (i = 0; i < rknpu_dev->config->num_irqs; i++) {
 		if (job->args->core_mask & rknpu_core_mask(i)) {
 			subcore_data = &rknpu_dev->subcore_datas[i];
-			if (job == subcore_data->job && !job->irq_entry[i]) {
+			if (job == subcore_data->job) {
+				/* #patch35: clear UNCONDITIONALLY.
+				 *
+				 * Upstream gates this on !job->irq_entry[i], but rknpu_job_cleanup()
+				 * below frees the job either way -- so whenever irq_entry[i] is set
+				 * this left a DANGLING pointer in subcore_data->job. The IRQ handler,
+				 * rknpu_job_next() and the progress watchdog all read that field, so
+				 * the next reader touches freed slab. The resulting corruption panics
+				 * somewhere unrelated seconds later (observed:
+				 * __memcg_kmem_charge_page via fork from dropbear, and
+				 * sg_free_table/__free_pages), which is why it never looked like an
+				 * NPU bug. Reached whenever an aborted job is stuck -- e.g. after
+				 * "switch iommu domain time out".
+				 *
+				 * Keep the task_num adjustment gated as before so the accounting is
+				 * unchanged; only the freed-pointer publication is fixed. */
+				if (!job->irq_entry[i])
+					subcore_data->task_num -=
+						rknpu_get_task_number(job, i);
 				subcore_data->job = NULL;
-				subcore_data->task_num -=
-					rknpu_get_task_number(job, i);
 			}
+			/* #patch67: drop the job from this core's todo_list
+			 * before rknpu_job_cleanup() frees it below.
+			 *
+			 * #patch35 above fixes the RUNNING job's dangling
+			 * pointer; this fixes the QUEUED one. A job aborted
+			 * while still on todo_list stayed linked, so the next
+			 * rknpu_job_next() list_first_entry()'d it and
+			 * list_del_init()'d through freed slab -- a WRITE to a
+			 * wild address (WnR=1), oopsing in rknpu_job_next via
+			 * rknpu_job_schedule/rknpu_submit_ioctl. Opened by a
+			 * concurrent domain switch reaping jobs
+			 * (rknpu_iommu_domain_get_and_switch ->
+			 * rknpu_reap_all_cores -> rknpu_job_timeout_clean)
+			 * while another thread submits.
+			 *
+			 * rknpu_job_wait() already does this on its "job commit
+			 * failed" path; the abort path did not. list_del_init()
+			 * is idempotent, so it is safe for a job that
+			 * rknpu_job_next() already dequeued. */
+			list_del_init(&job->head[i]);
 		}
 	}
 	spin_unlock_irqrestore(&rknpu_dev->irq_lock, flags);
@@ -601,7 +882,20 @@ static void rknpu_job_abort(struct rknpu_job *job)
 						       job->timestamp));
 			}
 		}
-		rknpu_soft_reset(rknpu_dev);
+		/* #patch42: a FAST-ABORTed job (#patch41) also lands here with -ETIMEDOUT, but a
+		 * device-wide rknpu_soft_reset() is the wrong hammer for it. Fast-abort fires
+		 * ~30x more often than the natural 60 s timeout it replaces, and each device-wide
+		 * reset disrupts healthy jobs on the OTHER cores. Measured: turning fast-abort on
+		 * cut submit failures 14 -> 2 but pushed the worst in-kernel wait 61.5 s -> 184.3 s,
+		 * because the extra resets stalled everyone else. Reset only the cores this job
+		 * actually owns; the device-wide path is kept for genuine timeouts. */
+		if (job->flags & RKNPU_JOB_STALLED) {
+			for (i = 0; i < rknpu_dev->config->num_irqs; i++)
+				if (job->args->core_mask & rknpu_core_mask(i))
+					rknpu_soft_reset_core(rknpu_dev, i);
+		} else {
+			rknpu_soft_reset(rknpu_dev);
+		}
 	} else {
 		LOG_ERROR(
 			"job abort, flags: %#x, ret: %d, elapsed time: %lldus\n",
@@ -646,13 +940,41 @@ static inline irqreturn_t rknpu_irq_handler(int irq, void *data, int core_index)
 	uint32_t status = 0;
 	unsigned long flags;
 
+	/* #patch: NEVER touch NPU MMIO when the block is powered down.
+	 *
+	 * Both paths below access registers unconditionally -- the no-job path does
+	 * REG_WRITE(RKNPU_INT_CLEAR), and the normal path does REG_READ(INT_STATUS).
+	 * rknpu_power_off() is driven by a DEFERRED work item (rknpu_power_off_delay_work),
+	 * so a late or spurious interrupt can arrive after power has gone. The register read
+	 * then takes an external abort and the machine dies instantly -- no console output,
+	 * no ping, requiring a power cycle.
+	 *
+	 * CAPTURED VIA NETCONSOLE 2026-08-26 (this is what that panic looked like):
+	 *   pc : readl+0x4/0x20
+	 *   lr : rknpu_irq_handler.isra.0+0x94/0x2f0
+	 *   Call trace: readl / rknpu_core0_irq_handler / __handle_irq_event_percpu
+	 *               ... el1_interrupt / cpuidle_enter / do_idle
+	 * CPU 0 was IDLE -- i.e. the NPU had finished and powered down, and the IRQ landed after.
+	 *
+	 * power_refcount is an atomic, so unlike power_lock (a mutex) it is safe to read from
+	 * hard-IRQ context. The check is racy in principle but closes the real window, which is
+	 * an interrupt arriving well after power-off. If we are unpowered the NPU cannot be
+	 * asserting anything, so IRQ_NONE is correct and cannot cause a level-IRQ storm. */
+	if (atomic_read(&rknpu_dev->power_refcount) <= 0) {
+		rknpu_cnt_unpow++;   /* #patch */
+		return IRQ_NONE;
+	}
+	rknpu_cnt_irq++;   /* #patch */
+
 	subcore_data = &rknpu_dev->subcore_datas[core_index];
 
 	spin_lock_irqsave(&rknpu_dev->irq_lock, flags);
 	job = subcore_data->job;
 	if (!job) {
+		rknpu_cnt_nojob++;   /* #patch */
 		spin_unlock_irqrestore(&rknpu_dev->irq_lock, flags);
-		REG_WRITE(RKNPU_INT_CLEAR, RKNPU_OFFSET_INT_CLEAR);
+		REG_WRITE(RKNPU_INT_CLEAR | rknpu_int_mask_extra,   /* #patch66 */
+			  RKNPU_OFFSET_INT_CLEAR);
 		rknpu_job_next(rknpu_dev, core_index);
 		return IRQ_HANDLED;
 	}
@@ -660,6 +982,19 @@ static inline irqreturn_t rknpu_irq_handler(int irq, void *data, int core_index)
 	spin_unlock_irqrestore(&rknpu_dev->irq_lock, flags);
 
 	status = REG_READ(RKNPU_OFFSET_INT_STATUS);
+	/* #patch66: did the previously-masked condition actually get delivered? */
+	if (rknpu_int_mask_extra && (status & rknpu_int_mask_extra)) {
+		if (++rknpu_int_extra_fired <= 8)
+			LOG_ERROR("RKNPU: core %d EXTRA INT delivered: status=%#x raw=%#x task counter=%#x\n",
+				  core_index, status,
+				  REG_READ(RKNPU_OFFSET_INT_RAW_STATUS),
+				  REG_READ(rknpu_dev->config->pc_task_status_offset) &
+					  rknpu_dev->config->pc_task_number_mask);
+		if (rknpu_int_extra_fired > 2000) {
+			rknpu_int_mask_extra = 0;   /* storm guard: disarm, do not hang the board */
+			LOG_ERROR("RKNPU: EXTRA INT storm (>2000) — disarming int_mask_extra\n");
+		}
+	}
 
 	job->int_status[core_index] = status;
 
@@ -670,11 +1005,13 @@ static inline irqreturn_t rknpu_irq_handler(int irq, void *data, int core_index)
 			job->int_mask[core_index],
 			(REG_READ(rknpu_dev->config->pc_task_status_offset) &
 			 rknpu_dev->config->pc_task_number_mask));
-		REG_WRITE(RKNPU_INT_CLEAR, RKNPU_OFFSET_INT_CLEAR);
+		REG_WRITE(RKNPU_INT_CLEAR | rknpu_int_mask_extra,   /* #patch66 */
+			  RKNPU_OFFSET_INT_CLEAR);
 		return IRQ_HANDLED;
 	}
 
-	REG_WRITE(RKNPU_INT_CLEAR, RKNPU_OFFSET_INT_CLEAR);
+	REG_WRITE(RKNPU_INT_CLEAR | rknpu_int_mask_extra,   /* #patch66 */
+			  RKNPU_OFFSET_INT_CLEAR);
 
 	rknpu_job_done(job, 0, core_index);
 
@@ -711,6 +1048,9 @@ static void rknpu_job_timeout_clean(struct rknpu_device *rknpu_dev,
 			if (job &&
 			    ktime_us_delta(ktime_get(), job->timestamp) >=
 				    job->args->timeout) {
+				rknpu_cnt_treap++;   /* #patch */
+				rknpu_cnt_treap_age =
+					ktime_us_delta(ktime_get(), job->timestamp);
 				rknpu_soft_reset(rknpu_dev);
 
 				spin_lock_irqsave(&rknpu_dev->irq_lock, flags);
@@ -718,6 +1058,8 @@ static void rknpu_job_timeout_clean(struct rknpu_device *rknpu_dev,
 				spin_unlock_irqrestore(&rknpu_dev->irq_lock,
 						       flags);
 
+				if (test_and_clear_bit(0, &job->dom_held))   /* #patch64 */
+					rknpu_iommu_domain_put(rknpu_dev); /* #patch: reap the domain ref this timed-out job leaked (job_done/job_abort put; timeout_clean forgot) -> fixes multi-domain switch wedge */
 				do {
 					schedule_work(&job->cleanup_work);
 
@@ -741,6 +1083,22 @@ static void rknpu_job_timeout_clean(struct rknpu_device *rknpu_dev,
 			}
 		}
 	}
+}
+
+/* #patch54: reap every core's timed-out job, releasing the iommu domain references they hold.
+ *
+ * Exported for the domain-switch escalation in rknpu_iommu.c. rknpu_job_timeout_clean() is not a
+ * watchdog -- it only runs when ANOTHER submit arrives -- so when a stuck job pins the domain
+ * refcount above zero there is nothing that will ever reap it, and every subsequent switch burns
+ * its full 6 s timeout forever. */
+void rknpu_reap_all_cores(struct rknpu_device *rknpu_dev)
+{
+	uint32_t mask = 0;
+	int i;
+
+	for (i = 0; i < rknpu_dev->config->num_irqs; i++)
+		mask |= rknpu_core_mask(i);
+	rknpu_job_timeout_clean(rknpu_dev, mask);
 }
 
 static int rknpu_submit(struct rknpu_device *rknpu_dev,
@@ -820,6 +1178,23 @@ static int rknpu_submit(struct rknpu_device *rknpu_dev,
 #endif
 	}
 
+	/* #patch39: arm the progress watchdog for EVERY submit, not just NONBLOCK ones.
+	 *
+	 * The arm used to live inside the NONBLOCK branch below, so a BLOCKING submit was never
+	 * observed by the watchdog at all. That is not a corner case: ork_dyn_colsplit() issues
+	 * blocking submits by default ("NO barrier + BLOCKING submit -- EXACTLY the mcworker",
+	 * src/npu/core/colsplit.c:48) and only goes NONBLOCK under ORK_F16_SENTINEL. Its
+	 * ork_dyn_ prefix makes it look like the doorbell path; it is not.
+	 *
+	 * Measured consequence: a 1.5B-Q8 run that stalled 8 times with wd_period_us=1000 recorded
+	 * wd_ticks=0 -- the hrtimer never started once, so the instrumentation built to catch these
+	 * stalls could not see the very path that stalls. A stalled blocking submit then sits in
+	 * rknpu_job_wait() for its full timeout (observed: 60.6 s) with nothing sampling it.
+	 *
+	 * A blocking job is in flight exactly like an async one, so there is no reason to treat it
+	 * differently; the handler still self-disarms once no core has a job. */
+	rknpu_wd_arm(rknpu_dev);
+
 	if (args->flags & RKNPU_JOB_NONBLOCK) {
 		job->flags |= RKNPU_JOB_ASYNC;
 		rknpu_job_timeout_clean(rknpu_dev, job->args->core_mask);
@@ -836,6 +1211,15 @@ static int rknpu_submit(struct rknpu_device *rknpu_dev,
 
 		args->task_counter = job->args->task_counter;
 		ret = job->ret;
+		if (!(args->flags & RKNPU_JOB_PC))
+			rknpu_dbg_nopc++;   /* #patchB7: blocking submit that never waited */
+		if (!ret && !(job->flags & RKNPU_JOB_DONE)) {   /* #patchB7 */
+			rknpu_dbg_false_ok++;
+			LOG_ERROR("RKNPU: SUBMIT returned OK but job NOT DONE: job_flags=%#x args_flags=%#x pc=%d tn=%u core=%#x counter=%u (n=%lu)\n",
+				  job->flags, args->flags,
+				  !!(args->flags & RKNPU_JOB_PC), args->task_number,
+				  args->core_mask, args->task_counter, rknpu_dbg_false_ok);
+		}
 		if (!ret)
 			rknpu_job_cleanup(job);
 		else

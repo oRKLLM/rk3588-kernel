@@ -72,7 +72,18 @@ static int rknpu_gem_get_pages(struct rknpu_gem_object *rknpu_obj)
 			      rknpu_obj->size);
 		goto free_sgt;
 	}
-	iommu_flush_iotlb_all(iommu_get_domain_for_dev(drm->dev));
+	/* #patchB9: flush the LIVE domain's IOTLB, not the core's default. Flushing domain 0 here left
+	 * stale translations for the pages just mapped into domain N. */
+	{
+		/* #patch68: iommu_flush_iotlb_all() dereferences domain->ops, so a NULL live domain
+		 * faults inside the IOMMU core. With no domain attached there is no stale TLB entry
+		 * to invalidate, so skipping is correct as well as safe. (patch33/34 guard the cookie
+		 * derefs in rknpu_iommu.c; this was the remaining unguarded live_domain consumer.) */
+		struct iommu_domain *fd = rknpu_iommu_live_domain(drm->dev);
+
+		if (fd)
+			iommu_flush_iotlb_all(fd);
+	}
 
 	if (rknpu_obj->flags & RKNPU_MEM_KERNEL_MAPPING) {
 		rknpu_obj->cookie = vmap(rknpu_obj->pages, rknpu_obj->num_pages,
@@ -501,7 +512,10 @@ static int rknpu_gem_alloc_buf_with_cache(struct rknpu_gem_object *rknpu_obj,
 	}
 
 	/* iova map to cache */
-	domain = iommu_get_domain_for_dev(rknpu_dev->dev);
+	/* #patchB9: map into the LIVE domain. iommu_get_domain_for_dev() is the core's default
+	 * (domain 0) under the light switch, so this used to map the SRAM/NBUF cache buffer into a
+	 * page table the NPU is not running in. */
+	domain = rknpu_iommu_live_domain(rknpu_dev->dev);
 	if (!domain) {
 		LOG_ERROR("failed to get iommu domain!");
 		return -EINVAL;
@@ -654,7 +668,7 @@ static void rknpu_gem_free_buf_with_cache(struct rknpu_gem_object *rknpu_obj,
 		return;
 	}
 
-	domain = iommu_get_domain_for_dev(rknpu_dev->dev);
+	domain = rknpu_iommu_live_domain(rknpu_dev->dev);   /* #patchB9: unmap from the LIVE domain */
 	if (domain) {
 		iommu_unmap(domain, rknpu_obj->iova_start, cache_size);
 		if (rknpu_obj->size > 0)
@@ -818,6 +832,102 @@ gem_release:
 	return ERR_PTR(ret);
 }
 
+/* #patch69: how many GEM objects were LEAKED by the destroy path bailing out.
+ *
+ * When a stalled job makes the domain switch time out, the loop below gives up after 3 attempts and
+ * returns without freeing — the object and its IOVA are leaked permanently. Recorded originally as
+ * "leak rather than corrupt", which is safe per event but accumulates. */
+unsigned long rknpu_dbg_destroy_bailed;
+EXPORT_SYMBOL(rknpu_dbg_destroy_bailed);
+
+/* #patch70: reclaim objects whose destroy could not switch domains.
+ *
+ * rknpu_gem_object_destroy() used to give up after 3 failed switches and RETURN WITHOUT FREEING,
+ * leaking the object and its IOVA permanently. Measured: 20 such bails and ~49 MB of outstanding IOVA
+ * in a SINGLE run. (That leak is not what wedges the device — the wedge is the domain mismatch — but
+ * it is a genuine resource leak on its own.)
+ *
+ * Instead of leaking, the object is queued here and reclaimed later. The drain deliberately only takes
+ * entries whose domain is ALREADY current: rknpu_iommu_domain_get_and_switch() then hits its
+ * same-domain fast path (increment, no switch, no 6 s timeout), so draining can never stall the caller.
+ * Objects for other domains simply wait until that domain comes around again.
+ *
+ * The acquire matters for balance: a deferred object never acquired a reference (its switch failed),
+ * and the free path below ends with rknpu_iommu_domain_put(). Taking one here keeps that paired. */
+static LIST_HEAD(rknpu_deferred_destroy);
+static DEFINE_MUTEX(rknpu_deferred_lock);
+unsigned long rknpu_dbg_destroy_reclaimed;
+EXPORT_SYMBOL(rknpu_dbg_destroy_reclaimed);
+
+static void rknpu_gem_drain_deferred(struct rknpu_device *rknpu_dev);
+
+/* The free half of rknpu_gem_object_destroy(), reachable both from the normal path and from the
+ * deferred reclaim. Assumes the caller has already made the object's domain current AND holds a
+ * domain reference — the trailing rknpu_iommu_domain_put() releases it. */
+static void rknpu_gem_free_body(struct rknpu_gem_object *rknpu_obj)
+{
+	struct drm_gem_object *obj = &rknpu_obj->base;
+	struct rknpu_device *rknpu_dev = obj->dev->dev_private;
+
+	/*
+	 * do not release memory region from exporter.
+	 *
+	 * the region will be released by exporter
+	 * once dmabuf's refcount becomes 0.
+	 */
+	if (obj->import_attach) {
+		/* #patchB10: dma_buf_unmap_attachment() unmaps through the DMA API too, so it must see
+		 * the same default domain the map saw. The caller has already switched to this object's
+		 * recorded domain, so the live domain IS the right one. */
+		struct iommu_domain *l = rknpu_dev->iommu_en ? rknpu_iommu_live_domain(rknpu_dev->dev) : NULL;
+		struct iommu_domain *sv = l ? rknpu_iommu_default_swap(rknpu_dev->dev, l) : NULL;
+
+		drm_prime_gem_destroy(obj, rknpu_obj->sgt);
+		if (sv)
+			rknpu_iommu_default_swap(rknpu_dev->dev, sv);
+		rknpu_gem_free_page(rknpu_obj->pages);
+	} else {
+		if (IS_ENABLED(CONFIG_ROCKCHIP_RKNPU_SRAM) &&
+		    rknpu_obj->sram_size > 0) {
+			if (rknpu_obj->sram_obj != NULL)
+				rknpu_mm_free(rknpu_dev->sram_mm,
+					      rknpu_obj->sram_obj);
+			rknpu_gem_free_buf_with_cache(rknpu_obj,
+						      RKNPU_CACHE_SRAM);
+		} else if (IS_ENABLED(CONFIG_NO_GKI) &&
+			   rknpu_obj->nbuf_size > 0) {
+			rknpu_gem_free_buf_with_cache(rknpu_obj,
+						      RKNPU_CACHE_NBUF);
+		} else {
+			rknpu_gem_free_buf(rknpu_obj);
+		}
+	}
+
+	rknpu_gem_release(rknpu_obj);
+	rknpu_iommu_domain_put(rknpu_dev);
+}
+
+static void rknpu_gem_drain_deferred(struct rknpu_device *rknpu_dev)
+{
+	struct rknpu_gem_object *o, *tmp;
+
+	if (list_empty(&rknpu_deferred_destroy))
+		return;
+
+	mutex_lock(&rknpu_deferred_lock);
+	list_for_each_entry_safe(o, tmp, &rknpu_deferred_destroy, deferred) {
+		if (o->iommu_domain_id != rknpu_dev->iommu_domain_id)
+			continue;   /* not this domain's turn — no switch, no timeout */
+		if (rknpu_iommu_domain_get_and_switch(rknpu_dev,
+						      o->iommu_domain_id))
+			continue;   /* same-domain fast path failed; try again later */
+		list_del(&o->deferred);
+		rknpu_dbg_destroy_reclaimed++;
+		rknpu_gem_free_body(o);
+	}
+	mutex_unlock(&rknpu_deferred_lock);
+}
+
 void rknpu_gem_object_destroy(struct rknpu_gem_object *rknpu_obj)
 {
 	struct drm_gem_object *obj = &rknpu_obj->base;
@@ -835,13 +945,25 @@ void rknpu_gem_object_destroy(struct rknpu_gem_object *rknpu_obj)
 			rknpu_dev, rknpu_obj->iommu_domain_id);
 
 		if (ret && ++wait_count >= 3) {
+			/* #patch70: QUEUE instead of leaking. Reclaimed by
+			 * rknpu_gem_drain_deferred() once this domain is current again. */
+			rknpu_dbg_destroy_bailed++;
 			LOG_DEV_ERROR(
 				rknpu_dev->dev,
-				"failed to destroy dma addr: %pad, size: %lu\n",
-				&rknpu_obj->dma_addr, rknpu_obj->size);
+				"cannot switch to domain %d to destroy dma addr %pad (%lu bytes) — DEFERRED, not leaked (defer #%lu)\n",
+				rknpu_obj->iommu_domain_id,
+				&rknpu_obj->dma_addr, rknpu_obj->size,
+				rknpu_dbg_destroy_bailed);
+			mutex_lock(&rknpu_deferred_lock);
+			list_add_tail(&rknpu_obj->deferred,
+				      &rknpu_deferred_destroy);
+			mutex_unlock(&rknpu_deferred_lock);
 			return;
 		}
 	} while (ret);
+
+	/* #patch70: this domain is current and referenced — reclaim anything queued for it. */
+	rknpu_gem_drain_deferred(rknpu_dev);
 
 	/*
 	 * do not release memory region from exporter.
@@ -850,7 +972,15 @@ void rknpu_gem_object_destroy(struct rknpu_gem_object *rknpu_obj)
 	 * once dmabuf's refcount becomes 0.
 	 */
 	if (obj->import_attach) {
+		/* #patchB10: dma_buf_unmap_attachment() unmaps through the DMA API too, so it must see
+		 * the same default domain the map saw. The caller has already switched to this object's
+		 * recorded domain, so the live domain IS the right one. */
+		struct iommu_domain *l = rknpu_dev->iommu_en ? rknpu_iommu_live_domain(rknpu_dev->dev) : NULL;
+		struct iommu_domain *sv = l ? rknpu_iommu_default_swap(rknpu_dev->dev, l) : NULL;
+
 		drm_prime_gem_destroy(obj, rknpu_obj->sgt);
+		if (sv)
+			rknpu_iommu_default_swap(rknpu_dev->dev, sv);
 		rknpu_gem_free_page(rknpu_obj->pages);
 	} else {
 		if (IS_ENABLED(CONFIG_ROCKCHIP_RKNPU_SRAM) &&
@@ -878,10 +1008,25 @@ int rknpu_gem_create_ioctl(struct drm_device *drm, void *data,
 {
 	struct rknpu_mem_create *args = data;
 	struct rknpu_gem_object *rknpu_obj = NULL;
+	struct drm_gem_object *obj = NULL;
 	int ret = -EINVAL;
 
-	rknpu_obj = rknpu_gem_object_find(file_priv, args->handle);
-	if (!rknpu_obj) {
+	/* #patch38: hold a real reference, same reasoning as #patch37 in
+	 * rknpu_gem_destroy_ioctl(). rknpu_gem_object_find() is lookup-then-put and returns an
+	 * UNREFERENCED pointer kept alive only by the handle table, so every dereference below
+	 * raced a concurrent close of that handle. The window here is far shorter than the
+	 * destroy path's (nothing sleeps between the lookup and the last use), which is why this
+	 * one is a hardening fix rather than a suspected crash source -- but the object is read
+	 * four times after the lookup, and correctness should not rest on "probably not
+	 * preempted there".
+	 *
+	 * Both branches below leave exactly ONE reference owned by us, dropped at the end. Net
+	 * refcount across the ioctl is unchanged from before: the handle keeps the object alive
+	 * afterwards, exactly as it always did. */
+	obj = drm_gem_object_lookup(file_priv, args->handle);
+	if (obj) {
+		rknpu_obj = to_rknpu_obj(obj);
+	} else {
 		rknpu_obj = rknpu_gem_object_create(drm, args->flags,
 						    args->size, args->sram_size,
 						    args->iommu_domain_id,
@@ -895,14 +1040,18 @@ int rknpu_gem_create_ioctl(struct drm_device *drm, void *data,
 			rknpu_gem_object_destroy(rknpu_obj);
 			return ret;
 		}
+		/* rknpu_gem_handle_create() dropped the allocation reference (the handle owns it
+		 * now), so take our own to match the lookup branch. */
+		obj = &rknpu_obj->base;
+		drm_gem_object_get(obj);
 	}
-
-	// rknpu_gem_object_get(&rknpu_obj->base);
 
 	args->size = rknpu_obj->size;
 	args->sram_size = rknpu_obj->sram_size;
 	args->obj_addr = (__u64)(uintptr_t)rknpu_obj;
 	args->dma_addr = rknpu_obj->dma_addr;
+
+	rknpu_gem_object_put(obj);
 
 	return 0;
 }
@@ -927,12 +1076,33 @@ int rknpu_gem_destroy_ioctl(struct drm_device *drm, void *data,
 	struct rknpu_device *rknpu_dev = drm->dev_private;
 	struct rknpu_gem_object *rknpu_obj = NULL;
 	struct rknpu_mem_destroy *args = data;
+	struct drm_gem_object *obj = NULL;
 	int ret = 0;
 	int wait_count = 0;
 
-	rknpu_obj = rknpu_gem_object_find(file_priv, args->handle);
-	if (!rknpu_obj)
+	/* #patch37: hold a REAL reference for the whole ioctl.
+	 *
+	 * rknpu_gem_object_find() is lookup-then-put -- it takes a reference via
+	 * drm_gem_object_lookup() and drops it again before returning, so the caller receives an
+	 * UNREFERENCED pointer kept alive only by the handle table. (Its kerneldoc, which claims
+	 * the refcount "would be increased", is wrong; that comment is how this was missed.)
+	 *
+	 * Survivable for a short ioctl. Not for this one: it then blocks in
+	 * rknpu_iommu_domain_get_and_switch() for up to 6 s per attempt, three attempts -- ~18 s --
+	 * and dereferences rknpu_obj->iommu_domain_id inside the loop. If the owning process dies
+	 * in that window (SIGTERM -> DRM file close -> every handle released -> objects freed) the
+	 * pointer dangles and we walk freed memory.
+	 *
+	 * The window is wide open in practice, not theoretical: a stalled NPU job is precisely what
+	 * makes the domain switch time out, and a stuck run is precisely when the process is killed.
+	 * Suspected source of the "BUG: Bad page cache ... still mapped when deleted" corruption
+	 * (rknpu maps GEM shmem pages with vm_insert_page() and clears VM_PFNMAP, and vma->vm_file
+	 * stays the DRM node -- so the shmem inode's i_mmap tree cannot find those VMAs to unmap at
+	 * evict, and the GEM refcount is the ONLY thing preventing a premature free). */
+	obj = drm_gem_object_lookup(file_priv, args->handle);
+	if (!obj)
 		return -EINVAL;
+	rknpu_obj = to_rknpu_obj(obj);
 
 	do {
 		ret = rknpu_iommu_domain_get_and_switch(
@@ -941,11 +1111,17 @@ int rknpu_gem_destroy_ioctl(struct drm_device *drm, void *data,
 		if (ret && ++wait_count >= 3) {
 			LOG_DEV_ERROR(rknpu_dev->dev,
 				      "failed to destroy memory\n");
+			rknpu_gem_object_put(obj);
 			return ret;
 		}
 	} while (ret);
 
 	ret = rknpu_gem_handle_destroy(file_priv, args->handle);
+
+	/* Drop ours BEFORE the domain put: if this was the last reference, the object's teardown
+	 * runs here with the domain still held -- the same ordering the original code had, where
+	 * handle_destroy itself could free the object at exactly this point. */
+	rknpu_gem_object_put(obj);
 
 	rknpu_iommu_domain_put(rknpu_dev);
 
@@ -1398,7 +1574,29 @@ int rknpu_gem_mmap(struct file *filp, struct vm_area_struct *vma)
 struct drm_gem_object *rknpu_gem_prime_import(struct drm_device *dev,
 					      struct dma_buf *dma_buf)
 {
-	return drm_gem_prime_import_dev(dev, dma_buf, dev->dev);
+	/* #patchB10: DRM core maps the attachment through the DMA API here, which always targets
+	 * group->default_domain. Point that at the LIVE domain for the duration of the import, so the
+	 * sg is mapped where the NPU will actually run, then restore. Without this an imported weight
+	 * lands in domain 0 while being recorded as domain N, and every submit against it is committed
+	 * and never completes. domain_lock keeps a concurrent switch from moving the live domain
+	 * underneath the map. */
+	struct rknpu_device *rknpu_dev = dev->dev_private;
+	struct drm_gem_object *obj;
+	struct iommu_domain *live, *saved = NULL;
+
+	if (!rknpu_dev->iommu_en)
+		return drm_gem_prime_import_dev(dev, dma_buf, dev->dev);
+
+	mutex_lock(&rknpu_dev->domain_lock);
+	live = rknpu_iommu_live_domain(rknpu_dev->dev);
+	if (live)
+		saved = rknpu_iommu_default_swap(rknpu_dev->dev, live);
+	obj = drm_gem_prime_import_dev(dev, dma_buf, dev->dev);
+	if (saved)
+		rknpu_iommu_default_swap(rknpu_dev->dev, saved);
+	mutex_unlock(&rknpu_dev->domain_lock);
+
+	return obj;
 }
 #endif
 
@@ -1422,6 +1620,7 @@ rknpu_gem_prime_import_sg_table(struct drm_device *dev,
 				struct sg_table *sgt)
 {
 	struct rknpu_gem_object *rknpu_obj = NULL;
+	struct rknpu_device *rknpu_dev = dev->dev_private;
 	int npages = 0;
 	int ret = -EINVAL;
 
@@ -1432,6 +1631,9 @@ rknpu_gem_prime_import_sg_table(struct drm_device *dev,
 	}
 
 	rknpu_obj->dma_addr = sg_dma_address(sgt->sgl);
+	/* #patch: the sg above was mapped against the CURRENTLY attached domain.
+	 * Record it, or destroy unmaps from domain 0 and strands this IOVA. */
+	rknpu_obj->iommu_domain_id = rknpu_dev->iommu_domain_id;
 
 	npages = rknpu_obj->size >> PAGE_SHIFT;
 	rknpu_obj->pages = rknpu_gem_alloc_page(npages);

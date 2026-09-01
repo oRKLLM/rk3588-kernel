@@ -134,6 +134,41 @@ enum e_rknpu_action {
 	RKNPU_GET_FREE_SRAM_SIZE = 23,
 	RKNPU_GET_IOMMU_DOMAIN_ID = 24,
 	RKNPU_SET_IOMMU_DOMAIN_ID = 25,
+
+	/* #patch: per-core reset, the symmetric counterpart of RKNPU_ACT_RESET (which is device-wide).
+	 * args->value = core index. Value 0x100 is deliberately outside the vendor's range so a future
+	 * vendor action cannot collide with it.
+	 *
+	 * Does per-core AXI+AHB reset AND the IOMMU re-attach: the re-attach is REQUIRED, because
+	 * rk_iommu shares the NPU reset domain, so resetting a core wipes its MMU programming and any
+	 * subsequent submit has a valid IOVA with no translation behind it. Measured: reset alone leaves
+	 * the job unrecoverable (deficit 2.0/stall); reset + re-attach recovers it (1.0/stall). */
+	RKNPU_ACT_RESET_CORE = 0x100,
+	/* #patch61: tear down and rebuild ALL iommu domain state — an explicit shortcut for the
+	 * reboot that is currently the only way to clear it. Outside the vendor range (0-25).
+	 *
+	 * WHY: unbalanced domain puts accumulate across runs (rknpu_job_abort drives the refcount to
+	 * zero while other cores still hold work) until every switch fails with
+	 * "mismatch domain get from iommu_get_domain_for_dev" and then every allocation fails with
+	 * "rknpu_gem_get_pages: dma map ... fail". Nothing clears it short of a reboot (~90 s, and it
+	 * destroys any in-RAM diagnostics).
+	 *
+	 * MANUAL and EXPLICIT — not fired automatically. The driver refuses with -EBUSY if any core
+	 * still has a job, so it cannot run underneath live work. CALLER CONTRACT: this changes the
+	 * IOVAs, so every existing buffer AND every regcmd built against those IOVAs is invalid
+	 * afterwards and must be rebuilt. */
+	RKNPU_ACT_REINIT = 0x101,
+
+	/* #patchB11: make an IOMMU domain LIVE, with no allocation.
+	 *
+	 * A dma-buf import maps its sg during PRIME_FD_TO_HANDLE, into whichever domain is live at that
+	 * moment — the ioctl carries no domain. The target domain is only named later, by MEM_CREATE,
+	 * which does NOT re-map an already-imported handle. So an import destined for domain N can land
+	 * in domain M, and every submit against it is committed and never completes.
+	 *
+	 * Userspace issues this before PRIME_FD_TO_HANDLE so the mapping lands where the weight will be
+	 * used. `value` = domain id. Switch and release: the caller holds no reference afterwards. */
+	RKNPU_ACT_SET_DOMAIN = 0x102,
 };
 
 /**

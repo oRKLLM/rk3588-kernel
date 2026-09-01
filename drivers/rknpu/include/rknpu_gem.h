@@ -44,6 +44,9 @@
  *	user can access the buffer through kms_bo.handle.
  */
 struct rknpu_gem_object {
+	/* #patch70: queue link used when destroy could not switch domains — see
+	 * rknpu_gem_object_destroy(). The object is RETAINED here rather than leaked. */
+	struct list_head deferred;
 	struct drm_gem_object base;
 	unsigned int flags;
 	unsigned long size;
@@ -121,7 +124,12 @@ static inline void rknpu_gem_object_put(struct drm_gem_object *obj)
 /*
  * get rknpu drm object from gem handle, this function could be used for
  * other drivers such as 2d/3d acceleration drivers.
- * with this function call, gem object reference count would be increased.
+ *
+ * #patch37 WARNING: this does NOT give you a reference. It looks the object up (which takes one)
+ * and immediately puts it back, so the returned pointer is kept alive ONLY by the handle table and
+ * is valid only while that handle cannot be closed concurrently. Do NOT hold it across anything
+ * that sleeps -- see rknpu_gem_destroy_ioctl(), which used to hold it across an ~18 s domain-switch
+ * wait. The previous version of this comment claimed the refcount "would be increased"; it does not.
  */
 static inline struct rknpu_gem_object *
 rknpu_gem_object_find(struct drm_file *filp, unsigned int handle)

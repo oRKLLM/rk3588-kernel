@@ -53,8 +53,21 @@ int rknpu_iommu_domain_get_and_switch(struct rknpu_device *rknpu_dev,
 				      int domain_id);
 int rknpu_iommu_domain_put(struct rknpu_device *rknpu_dev);
 
+/* #patchB9: THE LIVE DOMAIN. Under the light switch (#patchB1/B2) the IOMMU core is not involved in
+ * a domain change, so iommu_get_domain_for_dev() reports the group's DEFAULT domain (domain 0)
+ * forever. Every map/unmap/flush that must target the domain the NPU is actually running in has to
+ * use this instead. Using the core accessor silently targets domain 0: the mapping lands in the
+ * wrong page table and the next job is committed but never completes. */
+struct iommu_domain *rknpu_iommu_live_domain(struct device *dev);
+
+/* #patchB10: scoped override of the core's DEFAULT domain, for the dma-buf attachment map/unmap only
+ * (the DMA API cannot be told which domain to use). Returns the previous value; restore it. */
+struct iommu_domain *rknpu_iommu_default_swap(struct device *dev, struct iommu_domain *dom);
+
 #if KERNEL_VERSION(5, 10, 0) < LINUX_VERSION_CODE
 int iommu_get_dma_cookie(struct iommu_domain *domain);
 #endif
 
 #endif
+
+int rknpu_iommu_reinit(struct rknpu_device *rknpu_dev);   /* #patch61 */

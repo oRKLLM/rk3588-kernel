@@ -16,6 +16,7 @@
 #include <linux/regulator/consumer.h>
 #include <linux/version.h>
 #include <linux/hrtimer.h>
+#include <linux/workqueue.h>
 #include <linux/miscdevice.h>
 
 #include <soc/rockchip/rockchip_opp_select.h>
@@ -100,6 +101,11 @@ struct rknpu_subcore_data {
 	struct rknpu_job *job;
 	int64_t task_num;
 	struct rknpu_timer timer;
+	/* #patch: progress watchdog. wd_last = last PC completed-task counter seen,
+	 * wd_flat = consecutive samples with no advance. */
+	void *wd_job;   /* #patch44: job the wd_flat run belongs to */
+	u32 wd_last;
+	u32 wd_flat;
 };
 
 /**
@@ -159,6 +165,11 @@ struct rknpu_device {
 	struct rknpu_debugger debugger;
 	struct hrtimer timer;
 	ktime_t kt;
+	/* #patch: progress watchdog timer (armed on submit, self-disarms when idle) */
+	struct hrtimer wd_timer;
+	struct work_struct wd_work;
+	ktime_t wd_kt;
+	int wd_on;
 	phys_addr_t sram_start;
 	phys_addr_t sram_end;
 	phys_addr_t nbuf_start;
@@ -185,5 +196,7 @@ struct rknpu_session {
 int rknpu_power_get(struct rknpu_device *rknpu_dev);
 int rknpu_power_put(struct rknpu_device *rknpu_dev);
 int rknpu_power_put_delay(struct rknpu_device *rknpu_dev);
+
+void rknpu_wd_arm(struct rknpu_device *rknpu_dev);
 
 #endif /* __LINUX_RKNPU_DRV_H_ */
