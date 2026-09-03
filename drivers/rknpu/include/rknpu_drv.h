@@ -24,6 +24,7 @@
 
 #include "rknpu_job.h"
 #include "rknpu_fence.h"
+#include <linux/jump_label.h>
 #include "rknpu_debugger.h"
 #include "rknpu_mm.h"
 
@@ -46,6 +47,10 @@
 #define LOG_WARN(fmt, args...) pr_warning(LOG_TAG ": " fmt, ##args)
 #endif
 #define LOG_DEBUG(fmt, args...) pr_devel(LOG_TAG ": " fmt, ##args)
+
+/* Gate for the per-job counters (see the block above rknpu_dbg_key in rknpu_drv.c). A static key, so that
+ * when it is off -- the default -- each call site is a patched nop rather than a load and a test. */
+DECLARE_STATIC_KEY_FALSE(rknpu_dbg_key);
 #define LOG_ERROR(fmt, args...) pr_err(LOG_TAG ": " fmt, ##args)
 
 #define LOG_DEV_INFO(dev, fmt, args...) dev_info(dev, LOG_TAG ": " fmt, ##args)

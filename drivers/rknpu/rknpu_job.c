@@ -90,6 +90,19 @@ static int rknpu_get_task_number(struct rknpu_job *job, int core_index)
 	return task_num;
 }
 
+/* See the JOB COUNTERS block in rknpu_drv.c for what these are for and why only some are gated. */
+extern unsigned long rknpu_dbg_next_blocked, rknpu_dbg_next_blocked_logged,
+		     rknpu_dbg_blocked_slow;
+extern long rknpu_dbg_blocked_age_us;
+
+unsigned long rknpu_cnt_commit, rknpu_cnt_irq, rknpu_cnt_nojob, rknpu_cnt_unpow,
+	      rknpu_cnt_done;
+module_param_named(cnt_commit, rknpu_cnt_commit, ulong, 0444);
+module_param_named(cnt_irq, rknpu_cnt_irq, ulong, 0444);
+module_param_named(cnt_nojob, rknpu_cnt_nojob, ulong, 0444);
+module_param_named(cnt_unpow, rknpu_cnt_unpow, ulong, 0444);
+module_param_named(cnt_done, rknpu_cnt_done, ulong, 0444);
+
 static void rknpu_job_free(struct rknpu_job *job)
 {
 #ifdef CONFIG_ROCKCHIP_RKNPU_DRM_GEM
@@ -449,7 +462,41 @@ static void rknpu_job_next(struct rknpu_device *rknpu_dev, int core_index)
 
 	spin_lock_irqsave(&rknpu_dev->irq_lock, flags);
 
-	if (subcore_data->job || list_empty(&subcore_data->todo_list)) {
+	/* A submit that userspace saw succeed can still never reach the hardware. If this core is already
+	 * owned, the new job stays on todo_list and nothing re-drives it until the owner retires -- and an
+	 * owner whose completion was never accounted never retires, so every later submit on this core is
+	 * accepted and silently never dispatched. Userspace sees only a submit that never produces output,
+	 * with no kernel error, which is the signature this driver is worst at explaining.
+	 *
+	 * Age is the discriminator: a few hundred microseconds is a healthy core that is simply busy,
+	 * seconds means a stuck owner and a permanently undispatchable queue. Count the blocks, remember
+	 * the owner's age, and log the first few with its identity. */
+	if (subcore_data->job) {
+		struct rknpu_job *own = subcore_data->job;
+		s64 age_us = own->hw_commit_time ?
+			ktime_us_delta(ktime_get(), own->hw_commit_time) : -1;
+
+		if (static_branch_unlikely(&rknpu_dbg_key))
+			rknpu_dbg_next_blocked++;
+
+		if (age_us > 1000000) {
+			rknpu_dbg_blocked_slow++;
+			rknpu_dbg_blocked_age_us = (long)age_us;
+			if (rknpu_dbg_next_blocked_logged < 16) {
+				rknpu_dbg_next_blocked_logged++;
+				LOG_ERROR("core %d: NOT dispatching -- still owned by job %p (flags %#x, "
+					  "age %lldus, int_cnt %d, run_cnt %d); queued work will NOT run "
+					  "until it retires\n",
+					  core_index, own, own->flags, age_us,
+					  atomic_read(&own->interrupt_count),
+					  atomic_read(&own->run_count));
+			}
+		}
+		spin_unlock_irqrestore(&rknpu_dev->irq_lock, flags);
+		return;
+	}
+
+	if (list_empty(&subcore_data->todo_list)) {
 		spin_unlock_irqrestore(&rknpu_dev->irq_lock, flags);
 		return;
 	}
@@ -463,8 +510,11 @@ static void rknpu_job_next(struct rknpu_device *rknpu_dev, int core_index)
 	job->hw_recoder_time = job->hw_commit_time;
 	spin_unlock_irqrestore(&rknpu_dev->irq_lock, flags);
 
-	if (atomic_dec_and_test(&job->run_count))
+	if (atomic_dec_and_test(&job->run_count)) {
+		if (static_branch_unlikely(&rknpu_dbg_key))
+			rknpu_cnt_commit++;
 		rknpu_job_commit(job);
+	}
 }
 
 static void rknpu_job_done(struct rknpu_job *job, int ret, int core_index)
@@ -494,6 +544,9 @@ static void rknpu_job_done(struct rknpu_job *job, int ret, int core_index)
 
 	if (atomic_dec_and_test(&job->interrupt_count)) {
 		int use_core_num = job->use_core_num;
+
+		if (static_branch_unlikely(&rknpu_dbg_key))
+			rknpu_cnt_done++;
 
 		rknpu_iommu_domain_put(rknpu_dev);
 
@@ -674,14 +727,22 @@ static inline irqreturn_t rknpu_irq_handler(int irq, void *data, int core_index)
 	 * from hard IRQ context. If the device is unpowered it cannot be asserting an
 	 * interrupt, so IRQ_NONE is correct and cannot cause a level-IRQ storm.
 	 */
-	if (atomic_read(&rknpu_dev->power_refcount) <= 0)
+	if (atomic_read(&rknpu_dev->power_refcount) <= 0) {
+		/* NOT gated: this path is never taken on a healthy driver, so the increment is free, and
+		 * it is the standing regression canary for the async power bug. It must stay 0. */
+		rknpu_cnt_unpow++;
 		return IRQ_NONE;
+	}
+
+	if (static_branch_unlikely(&rknpu_dbg_key))
+		rknpu_cnt_irq++;
 
 	subcore_data = &rknpu_dev->subcore_datas[core_index];
 
 	spin_lock_irqsave(&rknpu_dev->irq_lock, flags);
 	job = subcore_data->job;
 	if (!job) {
+		rknpu_cnt_nojob++;   /* not gated: anomaly path */
 		spin_unlock_irqrestore(&rknpu_dev->irq_lock, flags);
 		REG_WRITE(RKNPU_INT_CLEAR, RKNPU_OFFSET_INT_CLEAR);
 		rknpu_job_next(rknpu_dev, core_index);

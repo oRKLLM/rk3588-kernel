@@ -301,6 +301,74 @@ static ssize_t rknpu_reset_set(struct file *file, const char __user *ubuf,
 	return len;
 }
 
+/* Job counters. The three per-job ones are gated (see rknpu_dbg_key); the rest sit on paths a healthy
+ * driver never takes, so they are always on and cost nothing. cnt_unpow is the standing canary for the
+ * job-scoped-power bug: completion interrupts dropped because the block was powered down under a live
+ * job. It should read 0 forever. */
+extern unsigned long rknpu_cnt_commit, rknpu_cnt_irq, rknpu_cnt_nojob,
+		     rknpu_cnt_unpow, rknpu_cnt_done;
+extern unsigned long rknpu_dbg_next_blocked, rknpu_dbg_next_blocked_logged,
+		     rknpu_dbg_blocked_slow;
+extern long rknpu_dbg_blocked_age_us;
+extern unsigned long rknpu_dbg_on;
+
+static int rknpu_counters_show(struct seq_file *m, void *data)
+{
+	bool on = static_key_enabled(&rknpu_dbg_key.key);
+
+	seq_printf(m, "gated counters: %s\n", on ? "on" : "off");
+	seq_printf(m, "  commit        %lu\n", rknpu_cnt_commit);
+	seq_printf(m, "  irq           %lu\n", rknpu_cnt_irq);
+	seq_printf(m, "  done          %lu\n", rknpu_cnt_done);
+	seq_printf(m, "  next_blocked  %lu\n", rknpu_dbg_next_blocked);
+	if (!on)
+		seq_puts(m, "  (write \"on\" to start counting these)\n");
+	seq_puts(m, "always-on anomaly counters (0 is healthy):\n");
+	seq_printf(m, "  unpow         %lu\tcompletion IRQs dropped, block powered off under a live job\n",
+		   rknpu_cnt_unpow);
+	seq_printf(m, "  nojob         %lu\tIRQ with no owning job\n", rknpu_cnt_nojob);
+	seq_printf(m, "  blocked_slow  %lu\tdispatch declined by an owner stuck over 1s\n",
+		   rknpu_dbg_blocked_slow);
+	seq_printf(m, "  blocked_age   %ld us\tage of that owner at the last such block\n",
+		   rknpu_dbg_blocked_age_us);
+
+	return 0;
+}
+
+static ssize_t rknpu_counters_set(struct file *file, const char __user *ubuf,
+				  size_t len, loff_t *offp)
+{
+	char buf[16];
+
+	if (len > sizeof(buf) - 1)
+		return -EINVAL;
+	if (copy_from_user(buf, ubuf, len))
+		return -EFAULT;
+	buf[len - 1] = '\0';
+
+	if (strcmp(buf, "on") == 0) {
+		static_branch_enable(&rknpu_dbg_key);
+		rknpu_dbg_on = 1;
+	} else if (strcmp(buf, "off") == 0) {
+		static_branch_disable(&rknpu_dbg_key);
+		rknpu_dbg_on = 0;
+	} else if (strcmp(buf, "reset") == 0) {
+		rknpu_cnt_commit = 0;
+		rknpu_cnt_irq = 0;
+		rknpu_cnt_done = 0;
+		rknpu_cnt_nojob = 0;
+		rknpu_cnt_unpow = 0;
+		rknpu_dbg_next_blocked = 0;
+		rknpu_dbg_next_blocked_logged = 0;
+		rknpu_dbg_blocked_slow = 0;
+		rknpu_dbg_blocked_age_us = 0;
+	} else {
+		return -EINVAL;
+	}
+
+	return len;
+}
+
 static struct rknpu_debugger_list rknpu_debugger_root_list[] = {
 	{ "version", rknpu_version_show, NULL, NULL },
 	{ "load", rknpu_load_show, NULL, NULL },
@@ -310,6 +378,7 @@ static struct rknpu_debugger_list rknpu_debugger_root_list[] = {
 	{ "delayms", rknpu_power_put_delay_show, rknpu_power_put_delay_set,
 	  NULL },
 	{ "reset", rknpu_reset_show, rknpu_reset_set, NULL },
+	{ "counters", rknpu_counters_show, rknpu_counters_set, NULL },
 #ifdef CONFIG_ROCKCHIP_RKNPU_SRAM
 	{ "mm", rknpu_mm_dump, NULL, NULL },
 #endif

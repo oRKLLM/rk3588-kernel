@@ -72,6 +72,49 @@ module_param(bypass_soft_reset, int, 0644);
 MODULE_PARM_DESC(bypass_soft_reset,
 		 "bypass RKNPU soft reset if set it to 1, disabled by default");
 
+/* JOB COUNTERS.
+ *
+ * "The submit was accepted and the output never arrived" is the failure this driver produces most often
+ * and explains least: the ioctl returns 0, no error is logged, and userspace is left unable to tell a job
+ * that never reached the hardware from one that ran and wrote somewhere unexpected. These counters make
+ * that distinction, and they are what localised the bug fixed by "rknpu: hold power for an async job's
+ * lifetime, not its ioctl's" -- cnt_unpow went from 3441 to 0.
+ *
+ * commit/irq/done/next_blocked are PER JOB: about 85k increments per pass of our test suite, on all three
+ * cores. So they are gated OFF by default, behind a static key -- "off" is not a branch on a flag, the
+ * call sites are patched to a nop and cost nothing. Flip it at runtime through the driver's own debugfs
+ * facility; no reboot and no module reload:
+ *
+ *     echo on    > /sys/kernel/debug/rknpu/counters   # start counting
+ *     cat          /sys/kernel/debug/rknpu/counters   # labelled dump plus the gate state
+ *     echo reset > /sys/kernel/debug/rknpu/counters   # zero them
+ *
+ * The raw values are also readable at /sys/module/rknpu/parameters/cnt_*, which is the stable
+ * machine-readable form; dbg_on there says whether they are being collected, so a reader can tell "zero
+ * because nothing happened" from "zero because nobody is counting".
+ *
+ * The ANOMALY counters are NOT gated and should not be. cnt_unpow, cnt_nojob and dbg_blocked_slow each
+ * sit on a path a healthy driver never takes -- all three read 0 across a full suite -- so the increment
+ * is free, and each names a specific defect. cnt_unpow in particular is the standing regression canary
+ * for the async power bug: completion interrupts dropped because the block was powered down under a live
+ * job. If it is ever nonzero again, that bug is back.
+ */
+DEFINE_STATIC_KEY_FALSE(rknpu_dbg_key);
+unsigned long rknpu_dbg_on;
+module_param_named(dbg_on, rknpu_dbg_on, ulong, 0444);
+MODULE_PARM_DESC(dbg_on, "1 if the gated job counters are being collected (see debugfs rknpu/counters)");
+
+/* Why a submit did not dispatch. dbg_next_blocked counts every declined dispatch, including the harmless
+ * ones a busy core produces constantly, so it is gated. The other two are the actual defect detector --
+ * an owner that has sat for over a second means a permanently undispatchable queue -- and stay always on. */
+unsigned long rknpu_dbg_next_blocked;
+unsigned long rknpu_dbg_next_blocked_logged;
+unsigned long rknpu_dbg_blocked_slow;
+long rknpu_dbg_blocked_age_us;
+module_param_named(dbg_next_blocked, rknpu_dbg_next_blocked, ulong, 0444);
+module_param_named(dbg_blocked_slow, rknpu_dbg_blocked_slow, ulong, 0444);
+module_param_named(dbg_blocked_age_us, rknpu_dbg_blocked_age_us, long, 0444);
+
 static const struct rknpu_irqs_data rknpu_irqs[] = {
 	{ "npu_irq", rknpu_core0_irq_handler }
 };
