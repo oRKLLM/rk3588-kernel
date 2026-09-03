@@ -7,6 +7,7 @@
 #include <linux/delay.h>
 #include <linux/iommu.h>
 
+#include "rknpu_job.h"
 #include "rknpu_reset.h"
 
 #ifndef FPGA_PLATFORM
@@ -134,7 +135,14 @@ int rknpu_soft_reset(struct rknpu_device *rknpu_dev)
 	if (ret) {
 		LOG_DEV_ERROR(rknpu_dev->dev,
 			      "failed to soft reset for rknpu: %d\n", ret);
+		/*
+		 * Clear the flag on the way out as well. Leaving it set disables dispatch for the whole
+		 * device permanently -- rknpu_job_next() returns immediately for every core, so a failed
+		 * reset does not degrade the NPU, it silently stops it.
+		 */
+		rknpu_dev->soft_reseting = false;
 		mutex_unlock(&rknpu_dev->reset_lock);
+		rknpu_job_redrive(rknpu_dev);
 		return ret;
 	}
 
@@ -152,6 +160,15 @@ int rknpu_soft_reset(struct rknpu_device *rknpu_dev)
 		rknpu_dev->config->state_init(rknpu_dev);
 
 	mutex_unlock(&rknpu_dev->reset_lock);
+
+	/*
+	 * Anything submitted while dispatch was disabled is still sitting on todo_list with nothing left
+	 * to promote it. Do it here, after state_init has reconfigured the block -- committing a job
+	 * before that would program a half-initialised device -- and after dropping reset_lock, because
+	 * a commit can lead back into rknpu_soft_reset(), whose mutex_trylock() would then fail and
+	 * silently skip a reset that was needed.
+	 */
+	rknpu_job_redrive(rknpu_dev);
 #endif
 
 	return 0;

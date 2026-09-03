@@ -90,6 +90,8 @@ static int rknpu_get_task_number(struct rknpu_job *job, int core_index)
 	return task_num;
 }
 
+extern unsigned long rknpu_cnt_reset_declined;
+
 static void rknpu_job_free(struct rknpu_job *job)
 {
 #ifdef CONFIG_ROCKCHIP_RKNPU_DRM_GEM
@@ -432,8 +434,16 @@ static void rknpu_job_next(struct rknpu_device *rknpu_dev, int core_index)
 	struct rknpu_subcore_data *subcore_data = NULL;
 	unsigned long flags;
 
-	if (rknpu_dev->soft_reseting)
+	if (rknpu_dev->soft_reseting) {
+		/*
+		 * Dispatch declined because a reset is in progress. If the caller was the completion
+		 * path, subcore_data->job has just been cleared, so this core is now idle with a
+		 * possibly non-empty queue and nothing else will come along to promote it -- see
+		 * rknpu_job_redrive(). Same rare path as the reset itself, so counting is free.
+		 */
+		rknpu_cnt_reset_declined++;
 		return;
+	}
 
 	subcore_data = &rknpu_dev->subcore_datas[core_index];
 
@@ -455,6 +465,60 @@ static void rknpu_job_next(struct rknpu_device *rknpu_dev, int core_index)
 
 	if (atomic_dec_and_test(&job->run_count))
 		rknpu_job_commit(job);
+}
+
+/* Re-drive every core's queue.
+ *
+ * rknpu_job_next() bails for every core while soft_reseting is set, and its only other callers are the
+ * completion path, rknpu_job_schedule() and rknpu_job_timeout_clean(). So a job submitted DURING a
+ * soft-reset window is put on todo_list, declined once, and then never re-driven: the reset clears the
+ * flag and nothing promotes the queue. The core is idle, so no completion interrupt will ever arrive to
+ * call rknpu_job_next() again, and the job sits there forever.
+ *
+ * Userspace sees a submit that SUCCEEDED and an output that never lands, with no kernel error, because
+ * nothing failed. Observed from userspace at such a stall: no commit, no interrupt, no completion, and a
+ * submit domain matching the weight's -- the job simply never reached the hardware.
+ *
+ * Call this once dispatch is enabled again. Idempotent: rknpu_job_next() is a no-op for a core that is
+ * already owned or whose queue is empty.
+ */
+unsigned long rknpu_cnt_reset_declined;
+module_param_named(cnt_reset_declined, rknpu_cnt_reset_declined, ulong, 0444);
+MODULE_PARM_DESC(cnt_reset_declined,
+		 "dispatch attempts declined because a soft reset was in progress");
+
+unsigned long rknpu_cnt_stranded;
+module_param_named(cnt_stranded, rknpu_cnt_stranded, ulong, 0444);
+MODULE_PARM_DESC(cnt_stranded,
+		 "jobs found queued on an idle core after dispatch was re-enabled (would have hung)");
+
+void rknpu_job_redrive(struct rknpu_device *rknpu_dev)
+{
+	unsigned long flags;
+	int i;
+
+	for (i = 0; i < rknpu_dev->config->num_irqs; i++) {
+		struct rknpu_subcore_data *subcore_data =
+			&rknpu_dev->subcore_datas[i];
+		bool stranded;
+
+		/*
+		 * An idle core with a non-empty queue is precisely the state this function exists to
+		 * fix: nothing owns the core, so no completion interrupt is coming to promote the
+		 * queue. Count it -- on a driver without this call every one of these was a job that
+		 * never ran, and the count is the only direct evidence the window is real.
+		 * Cheap: soft resets are rare, and this runs once per reset per core.
+		 */
+		spin_lock_irqsave(&rknpu_dev->irq_lock, flags);
+		stranded = !subcore_data->job &&
+			   !list_empty(&subcore_data->todo_list);
+		spin_unlock_irqrestore(&rknpu_dev->irq_lock, flags);
+
+		if (stranded)
+			rknpu_cnt_stranded++;
+
+		rknpu_job_next(rknpu_dev, i);
+	}
 }
 
 static void rknpu_job_done(struct rknpu_job *job, int ret, int core_index)
