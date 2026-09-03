@@ -101,6 +101,16 @@ static void rknpu_job_free(struct rknpu_job *job)
 		rknpu_gem_object_put(&task_obj->base);
 #endif
 
+	/*
+	 * Release the job's own power reference here rather than in rknpu_job_done() or
+	 * rknpu_job_abort(): this is the one point every job passes through exactly once,
+	 * including the rknpu_job_timeout_clean() path, which reaches cleanup directly
+	 * without going through either. It also has to be here for context -- job_done()
+	 * runs in hard IRQ, and rknpu_power_put_delay() takes power_lock, a mutex.
+	 */
+	if (test_and_clear_bit(0, &job->pwr_held))
+		rknpu_power_put_delay(job->rknpu_dev);
+
 	if (job->fence)
 		dma_fence_put(job->fence);
 
@@ -843,6 +853,20 @@ static int rknpu_submit(struct rknpu_device *rknpu_dev,
 
 	if (args->flags & RKNPU_JOB_NONBLOCK) {
 		job->flags |= RKNPU_JOB_ASYNC;
+		/*
+		 * The RKNPU_IOCTL() wrapper scopes a power reference to the ioctl. For a
+		 * blocking submit that is enough, because the ioctl does not return until
+		 * the job is done -- but this one returns as soon as the job is committed,
+		 * dropping the reference while the hardware is still running. Take a
+		 * second reference for the job itself; rknpu_job_free() releases it.
+		 *
+		 * rknpu_power_get() increments the refcount unconditionally and only reports
+		 * a failure from rknpu_power_on(), which cannot run here because the ioctl's
+		 * reference already has the block powered. So the bit is set either way --
+		 * the count was taken and must be given back.
+		 */
+		rknpu_power_get(rknpu_dev);
+		set_bit(0, &job->pwr_held);
 		rknpu_job_timeout_clean(rknpu_dev, job->args->core_mask);
 		rknpu_job_schedule(job);
 		ret = job->ret;
