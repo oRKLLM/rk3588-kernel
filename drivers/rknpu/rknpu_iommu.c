@@ -10,6 +10,7 @@
 #include <linux/delay.h>
 #include <linux/jiffies.h>
 
+#include "rknpu_job.h"
 #include "rknpu_iommu.h"
 
 #define RKNPU_SWITCH_DOMAIN_WAIT_TIME_MS 6000
@@ -640,6 +641,20 @@ int rknpu_iommu_switch_domain(struct rknpu_device *rknpu_dev, int domain_id)
 	return ret;
 }
 
+/*
+ * A domain switch waits for iommu_domain_refcount to read zero. One leaked
+ * reference therefore wedges the device permanently: every later switch burns
+ * its full RKNPU_SWITCH_DOMAIN_WAIT_TIME_MS and fails, and because
+ * rknpu_gem_object_create() switches domains, every later allocation fails too.
+ * On a timeout, reap whatever is still held by the cores and, if nothing is
+ * actually in flight, treat the residual count as leaked and retry once.
+ */
+static unsigned int rknpu_dom_reclaim = 1;
+module_param_named(dom_reclaim, rknpu_dom_reclaim, uint, 0644);
+MODULE_PARM_DESC(dom_reclaim,
+		 "reclaim a leaked IOMMU domain reference on switch timeout (default 1)");
+
+
 int rknpu_iommu_domain_get_and_switch(struct rknpu_device *rknpu_dev,
 				      int domain_id)
 {
@@ -647,6 +662,7 @@ int rknpu_iommu_domain_get_and_switch(struct rknpu_device *rknpu_dev,
 		msecs_to_jiffies(RKNPU_SWITCH_DOMAIN_WAIT_TIME_MS);
 	unsigned long start = jiffies;
 	int ret = -EINVAL;
+	int reclaimed = 0;
 
 	while (true) {
 		mutex_lock(&rknpu_dev->domain_lock);
@@ -680,6 +696,42 @@ int rknpu_iommu_domain_get_and_switch(struct rknpu_device *rknpu_dev,
 				rknpu_dev->dev,
 				"switch iommu domain time out, failed to switch iommu domain, id: %d\n",
 				domain_id);
+
+			if (rknpu_dom_reclaim && !reclaimed) {
+				unsigned long f;
+				int k, busy = 0;
+
+				reclaimed = 1;
+				rknpu_reap_all_cores(rknpu_dev);
+
+				spin_lock_irqsave(&rknpu_dev->irq_lock, f);
+				for (k = 0; k < rknpu_dev->config->num_irqs; k++)
+					if (rknpu_dev->subcore_datas[k].job)
+						busy++;
+				spin_unlock_irqrestore(&rknpu_dev->irq_lock, f);
+
+				if (!busy) {
+					int rc = atomic_read(
+						&rknpu_dev->iommu_domain_refcount);
+
+					if (rc != 0) {
+						LOG_DEV_ERROR(
+							rknpu_dev->dev,
+							"reclaim: no jobs in flight but refcount=%d -- forcing to 0\n",
+							rc);
+						atomic_set(&rknpu_dev->iommu_domain_refcount,
+							   0);
+					}
+					start = jiffies;
+					continue;
+				}
+
+				LOG_DEV_ERROR(
+					rknpu_dev->dev,
+					"reclaim: %d job(s) survived the reap -- cannot release the domain\n",
+					busy);
+			}
+
 			return -EINVAL;
 		}
 	}

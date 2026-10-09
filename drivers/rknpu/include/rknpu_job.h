@@ -89,4 +89,6 @@ int rknpu_get_rw_amount(struct rknpu_device *rknpu_dev, uint32_t *dt_wr,
 
 int rknpu_get_total_rw_amount(struct rknpu_device *rknpu_dev, uint32_t *amount);
 
+void rknpu_reap_all_cores(struct rknpu_device *rknpu_dev);
+
 #endif /* __LINUX_RKNPU_JOB_H_ */

@@ -822,6 +822,16 @@ static void rknpu_job_timeout_clean(struct rknpu_device *rknpu_dev,
 	}
 }
 
+void rknpu_reap_all_cores(struct rknpu_device *rknpu_dev)
+{
+	uint32_t mask = 0;
+	int i;
+
+	for (i = 0; i < rknpu_dev->config->num_irqs; i++)
+		mask |= rknpu_core_mask(i);
+	rknpu_job_timeout_clean(rknpu_dev, mask);
+}
+
 static int rknpu_submit(struct rknpu_device *rknpu_dev,
 			struct rknpu_submit *args)
 {
