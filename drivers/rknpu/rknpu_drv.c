@@ -866,8 +866,31 @@ static enum hrtimer_restart hrtimer_handler(struct hrtimer *timer)
  * reboot — or, for wide 27B prefill, a physical SPI reflash. So arm it while bringing up new shapes:
  *     echo 10000 > /sys/module/rknpu/parameters/wd_period_us   # detect + log
  *     echo 2000  > /sys/module/rknpu/parameters/wd_abort_ms    # AND fail the submit (opt-in on top)
- * The cheap counters (cnt_commit / cnt_done / cnt_irq) are always on and cost nothing — they are what
- * actually localised the bug this was built for. */
+ * The per-job counters (cnt_commit / cnt_done / cnt_irq) are what actually localised the bug this was
+ * built for, but they increment once per commit and once per interrupt on all three cores -- ~85k times
+ * per test-suite pass -- so they are gated OFF by default. The gate is a STATIC KEY, so "off" is not a
+ * branch on a flag: the call sites are patched to a nop and cost literally nothing. It is flipped at
+ * runtime through the driver's own debugfs facility, so an investigation does not need a reboot:
+ *     echo on    > /sys/kernel/debug/rknpu/counters   # start counting
+ *     cat          /sys/kernel/debug/rknpu/counters   # labelled dump + gate state
+ *     echo reset > /sys/kernel/debug/rknpu/counters   # zero them
+ * The raw values stay readable at /sys/module/rknpu/parameters/cnt_* as well; that is the stable
+ * machine-readable form the userspace doorbell probe in ork-driver parses when a submit gives up.
+ *
+ * The ANOMALY counters are NOT gated and never should be. cnt_unpow, cnt_nojob, dbg_blocked_slow,
+ * wd_stalls, cnt_kick and dbg_destroy_bailed each sit on a path a healthy driver never takes -- all six
+ * read 0 across a full suite -- so the increment costs nothing, and each one names a specific defect.
+ * cnt_unpow in particular is the standing canary for the bug fixed by the job-scoped power reference: it
+ * counts completion interrupts dropped because the block was powered down under a live job, and it went
+ * from 3441 to 0. If it is ever nonzero again, that regression is back. */
+DEFINE_STATIC_KEY_FALSE(rknpu_dbg_key);
+/* A plain mirror of the key, readable without debugfs. Userspace has to be able to tell "the counters say
+ * zero because nothing happened" from "the counters say zero because nobody is counting" -- the ork-driver
+ * doorbell probe reads the cnt_* params on a stall and would otherwise report every failure as NEVER
+ * COMMITTED. Written only by the debugfs handler, so it cannot drift. */
+unsigned long rknpu_dbg_on;
+module_param_named(dbg_on, rknpu_dbg_on, ulong, 0444);
+MODULE_PARM_DESC(dbg_on, "1 if the gated job counters are being collected (see debugfs rknpu/counters)");
 static unsigned int rknpu_wd_period_us;   /* 0 = off; see above */
 module_param_named(wd_period_us, rknpu_wd_period_us, uint, 0644);
 MODULE_PARM_DESC(wd_period_us, "progress watchdog sample period in us (0 = off, the default; set 10000 to arm developer stall detection)");
@@ -893,6 +916,20 @@ module_param_named(wd_stalls, rknpu_wd_stalls, ulong, 0444);
  * flight). Opt-in while under evaluation. */
 static unsigned long rknpu_cnt_kick;
 module_param_named(cnt_kick, rknpu_cnt_kick, ulong, 0444);
+
+/* #patch71: why a submit did not dispatch. Readable at /sys/module/rknpu/parameters/dbg_* so userspace can
+ * dump them at the exact moment it gives up waiting for a doorbell sentinel.
+ *
+ * dbg_next_blocked counts EVERY declined dispatch, including the harmless ones a busy core produces
+ * constantly, so it is gated behind `dbg`. The other two are the actual defect detector -- an owner that
+ * has sat for over a second is a permanently undispatchable queue -- and stay always on. */
+unsigned long rknpu_dbg_next_blocked;        /* rknpu_job_next declined: core already owned */
+unsigned long rknpu_dbg_next_blocked_logged; /* how many we have logged (cap the spam) */
+unsigned long rknpu_dbg_blocked_slow;        /* subset where the owner had sat >1s (a STUCK owner) */
+long rknpu_dbg_blocked_age_us;               /* owner age at the last slow block */
+module_param_named(dbg_next_blocked, rknpu_dbg_next_blocked, ulong, 0444);
+module_param_named(dbg_blocked_slow, rknpu_dbg_blocked_slow, ulong, 0444);
+module_param_named(dbg_blocked_age_us, rknpu_dbg_blocked_age_us, long, 0444);
 
 static unsigned int rknpu_wd_samples = 12;
 /* #patch41: FAST-ABORT. When a BLOCKING submit stalls, its caller sits in rknpu_job_wait() for

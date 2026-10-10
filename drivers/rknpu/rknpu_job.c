@@ -14,6 +14,10 @@
 #include "rknpu_drv.h"
 #include "rknpu_reset.h"
 #include "rknpu_gem.h"
+
+/* #patch71 counters: defined in rknpu_drv.c, exported via /sys/module/rknpu/parameters/ */
+extern unsigned long rknpu_dbg_next_blocked, rknpu_dbg_next_blocked_logged, rknpu_dbg_blocked_slow;
+extern long rknpu_dbg_blocked_age_us;
 #include "rknpu_fence.h"
 #include "rknpu_mem.h"
 #include <linux/iommu.h>
@@ -95,8 +99,8 @@ static unsigned long rknpu_cnt_treap;
 static unsigned long rknpu_cnt_treap_age;
 module_param_named(cnt_treap, rknpu_cnt_treap, ulong, 0444);
 module_param_named(cnt_treap_age, rknpu_cnt_treap_age, ulong, 0444);
-static unsigned long rknpu_cnt_commit, rknpu_cnt_irq, rknpu_cnt_nojob,
-                     rknpu_cnt_unpow, rknpu_cnt_done;
+unsigned long rknpu_cnt_commit, rknpu_cnt_irq, rknpu_cnt_nojob,
+		      rknpu_cnt_unpow, rknpu_cnt_done;
 module_param_named(cnt_commit, rknpu_cnt_commit, ulong, 0444);
 module_param_named(cnt_irq,    rknpu_cnt_irq,    ulong, 0444);
 module_param_named(cnt_nojob,  rknpu_cnt_nojob,  ulong, 0444);
@@ -175,6 +179,10 @@ static int rknpu_get_task_number(struct rknpu_job *job, int core_index)
 	return task_num;
 }
 
+extern unsigned long rknpu_cnt_reset_declined;
+extern u64 rknpu_hw_ns_sum;
+extern unsigned long rknpu_hw_n;
+
 static void rknpu_job_free(struct rknpu_job *job)
 {
 #ifdef CONFIG_ROCKCHIP_RKNPU_DRM_GEM
@@ -185,6 +193,16 @@ static void rknpu_job_free(struct rknpu_job *job)
 	if (task_obj)
 		rknpu_gem_object_put(&task_obj->base);
 #endif
+
+	/*
+	 * Release the job's own power reference here rather than in rknpu_job_done() or
+	 * rknpu_job_abort(): this is the one point every job passes through exactly once,
+	 * including the rknpu_job_timeout_clean() path, which reaches cleanup directly
+	 * without going through either. It also has to be here for context -- job_done()
+	 * runs in hard IRQ, and rknpu_power_put_delay() takes power_lock, a mutex.
+	 */
+	if (test_and_clear_bit(0, &job->pwr_held))
+		rknpu_power_put_delay(job->rknpu_dev);
 
 	if (job->fence) {
 		/* #patch: a job torn down WITHOUT completing (rknpu_job_timeout_clean /
@@ -415,7 +433,8 @@ static inline int rknpu_job_subcore_commit_pc(struct rknpu_job *job,
 	int i = 0;
 	int submit_index = atomic_read(&job->submit_count[core_index]);
 
-	rknpu_cnt_commit++;   /* #patch */
+	if (static_branch_unlikely(&rknpu_dbg_key))
+		rknpu_cnt_commit++;   /* #patch: hot path -- see `dbg` in rknpu_drv.c */
 	int max_submit_number = rknpu_dev->config->max_submit_number;
 	unsigned long flags;
 
@@ -590,14 +609,55 @@ static void rknpu_job_next(struct rknpu_device *rknpu_dev, int core_index)
 	struct rknpu_subcore_data *subcore_data = NULL;
 	unsigned long flags;
 
-	if (rknpu_dev->soft_reseting)
+	if (rknpu_dev->soft_reseting) {
+		/*
+		 * Dispatch declined because a reset is in progress. If the caller was the completion
+		 * path, subcore_data->job has just been cleared, so this core is now idle with a
+		 * possibly non-empty queue and nothing else will come along to promote it -- see
+		 * rknpu_job_redrive(). Same rare path as the reset itself, so counting is free.
+		 */
+		rknpu_cnt_reset_declined++;
 		return;
+	}
 
 	subcore_data = &rknpu_dev->subcore_datas[core_index];
 
 	spin_lock_irqsave(&rknpu_dev->irq_lock, flags);
 
-	if (subcore_data->job || list_empty(&subcore_data->todo_list)) {
+	/* #patch71: THE "COMMITTED, NEVER COMPLETES" DECISION POINT.
+	 *
+	 * A submit that userspace saw succeed can still never reach the hardware: if this core is already
+	 * owned (subcore_data->job != NULL) the new job stays on todo_list and nothing re-drives it until
+	 * that owner retires. When the owner is a job that TIMED OUT and was aborted but never reaped, it
+	 * never retires -- so every later submit on this core is accepted and silently never dispatched.
+	 * Userspace sees only "doorbell sentinel never landed", with no kernel error, which is exactly the
+	 * signature this project has repeatedly mistaken for silicon.
+	 *
+	 * Record it: count the blocks, remember how long the owner has been sitting there, and log the first
+	 * few with the owner's identity. Age is the discriminator -- a few hundred microseconds is a healthy
+	 * core that is simply busy; seconds means a stuck owner and a permanently undispatchable queue. */
+	if (subcore_data->job) {
+		struct rknpu_job *own = subcore_data->job;
+		s64 age_us = own->hw_commit_time ?
+				     ktime_us_delta(ktime_get(), own->hw_commit_time) : -1;
+		if (static_branch_unlikely(&rknpu_dbg_key))
+			rknpu_dbg_next_blocked++;
+		/* Only the SLOW blocks are interesting; a busy core blocks constantly and harmlessly. */
+		if (age_us > 1000000) {
+			rknpu_dbg_blocked_slow++;
+			rknpu_dbg_blocked_age_us = (long)age_us;
+		}
+		if (age_us > 1000000 && rknpu_dbg_next_blocked_logged < 16) {
+			rknpu_dbg_next_blocked_logged++;
+			LOG_ERROR("core %d: NOT dispatching -- still owned by job %p (flags %#x, age %lldus, "
+				  "int_cnt %d, run_cnt %d); queued work will NOT run until it retires\n",
+				  core_index, own, own->flags, age_us,
+				  atomic_read(&own->interrupt_count), atomic_read(&own->run_count));
+		}
+		spin_unlock_irqrestore(&rknpu_dev->irq_lock, flags);
+		return;
+	}
+	if (list_empty(&subcore_data->todo_list)) {
 		spin_unlock_irqrestore(&rknpu_dev->irq_lock, flags);
 		return;
 	}
@@ -658,6 +718,67 @@ static void rknpu_job_next(struct rknpu_device *rknpu_dev, int core_index)
 		rknpu_job_commit(job);
 }
 
+/* #patch72: RE-DRIVE THE QUEUE AFTER DISPATCH WAS DISABLED.
+ *
+ * rknpu_job_next() bails for every core while soft_reseting is set, and its only other callers are the
+ * completion path, rknpu_job_schedule() and timeout_clean. So a job submitted DURING a soft-reset window
+ * is put on todo_list, declined once, and then never re-driven: the reset clears the flag and nothing
+ * promotes the queue. The core is idle, no completion IRQ will ever arrive to call job_next again, and the
+ * job sits there forever.
+ *
+ * Userspace sees a submit that SUCCEEDED and then an output that never lands -- with no kernel error,
+ * because nothing failed. MEASURED from userspace at the moment of the stall: cnt_commit+0, cnt_irq+0,
+ * cnt_done+0, submit_dom == weight_dom (so not a page-table mismatch), core_mask=0x1 -- i.e. the job never
+ * reached the hardware at all.
+ *
+ * Call this after clearing soft_reseting. Idempotent: job_next is a no-op for a core that is already
+ * owned or whose queue is empty. */
+unsigned long rknpu_cnt_reset_declined;
+module_param_named(cnt_reset_declined, rknpu_cnt_reset_declined, ulong, 0444);
+
+/* #patch74: see rknpu_job_done. Writable (0644) so a userspace probe can zero them around a timed
+ * region and get a clean per-job hardware average. */
+u64 rknpu_hw_ns_sum;
+unsigned long rknpu_hw_n;
+module_param_named(hw_ns_sum, rknpu_hw_ns_sum, ullong, 0644);
+module_param_named(hw_n, rknpu_hw_n, ulong, 0644);
+MODULE_PARM_DESC(cnt_reset_declined,
+		 "dispatch attempts declined because a soft reset was in progress");
+
+unsigned long rknpu_cnt_stranded;
+module_param_named(cnt_stranded, rknpu_cnt_stranded, ulong, 0444);
+MODULE_PARM_DESC(cnt_stranded,
+		 "jobs found queued on an idle core after dispatch was re-enabled (would have hung)");
+
+void rknpu_job_redrive(struct rknpu_device *rknpu_dev)
+{
+	unsigned long flags;
+	int i;
+
+	for (i = 0; i < rknpu_dev->config->num_irqs; i++) {
+		struct rknpu_subcore_data *subcore_data =
+			&rknpu_dev->subcore_datas[i];
+		bool stranded;
+
+		/*
+		 * An idle core with a non-empty queue is precisely the state this function exists to
+		 * fix: nothing owns the core, so no completion interrupt is coming to promote the
+		 * queue. Count it -- on a driver without this call every one of these was a job that
+		 * never ran, and the count is the only direct evidence the window is real.
+		 * Cheap: soft resets are rare, and this runs once per reset per core.
+		 */
+		spin_lock_irqsave(&rknpu_dev->irq_lock, flags);
+		stranded = !subcore_data->job &&
+			   !list_empty(&subcore_data->todo_list);
+		spin_unlock_irqrestore(&rknpu_dev->irq_lock, flags);
+
+		if (stranded)
+			rknpu_cnt_stranded++;
+
+		rknpu_job_next(rknpu_dev, i);
+	}
+}
+
 static void rknpu_job_done(struct rknpu_job *job, int ret, int core_index)
 {
 	struct rknpu_device *rknpu_dev = job->rknpu_dev;
@@ -680,13 +801,22 @@ static void rknpu_job_done(struct rknpu_job *job, int ret, int core_index)
 	subcore_data->task_num -= rknpu_get_task_number(job, core_index);
 	now = ktime_get();
 	job->hw_elapse_time = ktime_sub(now, job->hw_commit_time);
+	/* #patch74: HARDWARE time per job, summed in the kernel. Userspace measures completion by polling a
+	 * DRAM sentinel, so its "poll time" is hardware time PLUS however long it takes to NOTICE. A probe and
+	 * a real consumer disagree 2x on the same shape with everything measurable held equal (twelve causes
+	 * disproven), and this is the one split userspace cannot make: if hw_ns_sum/hw_n agrees across the two,
+	 * the hardware is fine and the gap is detection latency; if it disagrees, the hardware is genuinely
+	 * slower. One add per completion, on the normal path. */
+	rknpu_hw_ns_sum += (u64)ktime_to_ns(job->hw_elapse_time);
+	rknpu_hw_n++;
 	subcore_data->timer.busy_time += ktime_sub(now, job->hw_recoder_time);
 	spin_unlock_irqrestore(&rknpu_dev->irq_lock, flags);
 
 	if (atomic_dec_and_test(&job->interrupt_count)) {
 		int use_core_num = job->use_core_num;
 
-		rknpu_cnt_done++;   /* #patch */
+		if (static_branch_unlikely(&rknpu_dbg_key))
+			rknpu_cnt_done++;   /* #patch: hot path */
 		if (job->dbg_kick_t)
 			LOG_ERROR("RKNPU:   KICKED JOB COMPLETED %lldus after the kick\n",
 				  ktime_us_delta(ktime_get(), job->dbg_kick_t));
@@ -961,17 +1091,18 @@ static inline irqreturn_t rknpu_irq_handler(int irq, void *data, int core_index)
 	 * an interrupt arriving well after power-off. If we are unpowered the NPU cannot be
 	 * asserting anything, so IRQ_NONE is correct and cannot cause a level-IRQ storm. */
 	if (atomic_read(&rknpu_dev->power_refcount) <= 0) {
-		rknpu_cnt_unpow++;   /* #patch */
+		rknpu_cnt_unpow++;   /* #patch: NOT gated -- standing canary, 0 on a healthy driver */
 		return IRQ_NONE;
 	}
-	rknpu_cnt_irq++;   /* #patch */
+	if (static_branch_unlikely(&rknpu_dbg_key))
+		rknpu_cnt_irq++;   /* #patch: hot path */
 
 	subcore_data = &rknpu_dev->subcore_datas[core_index];
 
 	spin_lock_irqsave(&rknpu_dev->irq_lock, flags);
 	job = subcore_data->job;
 	if (!job) {
-		rknpu_cnt_nojob++;   /* #patch */
+		rknpu_cnt_nojob++;   /* #patch: NOT gated -- anomaly path */
 		spin_unlock_irqrestore(&rknpu_dev->irq_lock, flags);
 		REG_WRITE(RKNPU_INT_CLEAR | rknpu_int_mask_extra,   /* #patch66 */
 			  RKNPU_OFFSET_INT_CLEAR);
@@ -1197,6 +1328,29 @@ static int rknpu_submit(struct rknpu_device *rknpu_dev,
 
 	if (args->flags & RKNPU_JOB_NONBLOCK) {
 		job->flags |= RKNPU_JOB_ASYNC;
+		/*
+		 * #patch73: the RKNPU_IOCTL() wrapper scopes a power reference to the ioctl. For a
+		 * blocking submit that is enough, because the ioctl does not return until the job is
+		 * done -- but this one returns as soon as the job is committed, dropping the reference
+		 * while the hardware is still running. The deferred power-off then fires under a live
+		 * job and the completion interrupt lands on an unpowered block, where rknpu_irq_handler
+		 * must bail (touching MMIO unpowered killed the machine outright -- see the netconsole
+		 * panic note there). The completion is then never accounted: interrupt_count is only
+		 * decremented in rknpu_job_done(), reached only from that handler, so the job owns its
+		 * core forever and every later submit queues behind it and never commits.
+		 * MEASURED: cnt_unpow = 3441 dropped interrupts, and a stuck owner logged with
+		 * "flags 0x2, int_cnt 1, run_cnt 0" at 60s of age.
+		 *
+		 * rknpu_power_get() increments the refcount unconditionally and only reports a failure
+		 * from rknpu_power_on(), which cannot run here because the ioctl reference already has
+		 * the block powered. So set the bit either way -- the count was taken.
+		 * Released in rknpu_job_free(): the one point every job passes through exactly once
+		 * (including rknpu_job_timeout_clean(), which reaches cleanup through neither job_done
+		 * nor job_abort), and the right context -- job_done() runs in hard IRQ while
+		 * rknpu_power_put_delay() takes power_lock, a mutex.
+		 */
+		rknpu_power_get(rknpu_dev);
+		set_bit(0, &job->pwr_held);
 		rknpu_job_timeout_clean(rknpu_dev, job->args->core_mask);
 		rknpu_job_schedule(job);
 		ret = job->ret;

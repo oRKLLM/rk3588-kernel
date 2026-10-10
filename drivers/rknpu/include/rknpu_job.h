@@ -50,6 +50,14 @@ struct rknpu_job {
 	 * Its own word (not a bit in ->flags) because the releases run from both IRQ and process
 	 * context, so the test-and-clear must be atomic. */
 	unsigned long dom_held;
+	/* #patch73: set while this job holds a power reference of its own. An async
+	 * (RKNPU_JOB_NONBLOCK) job outlives the ioctl that created it, so it cannot rely on the
+	 * ioctl reference to keep the block powered -- see rknpu_job_submit(). */
+	unsigned long pwr_held;
+	/* #patch73: this ASYNC job holds a POWER reference. RKNPU_IOCTL scopes power_get/put_delay to the
+	 * IOCTL, which covers a blocking submit (it waits for completion inside) but NOT a NONBLOCK one: that
+	 * returns as soon as the job is scheduled, the put_delay countdown starts while the job is still on the
+	 * hardware, and the completion IRQ then arrives with the block powered down. */
 	int ret;
 	struct rknpu_submit *args;
 	bool args_owner;
@@ -108,6 +116,8 @@ int rknpu_get_rw_amount(struct rknpu_device *rknpu_dev, uint32_t *dt_wr,
 			uint32_t *dt_rd, uint32_t *wd_rd);
 
 int rknpu_get_total_rw_amount(struct rknpu_device *rknpu_dev, uint32_t *amount);
+
+void rknpu_job_redrive(struct rknpu_device *rknpu_dev);   /* #patch72 */
 
 #endif /* __LINUX_RKNPU_JOB_H_ */
 

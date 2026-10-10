@@ -188,6 +188,10 @@ int rknpu_reset_core_and_remap(struct rknpu_device *rknpu_dev, int core)
 	}
 	rknpu_dev->soft_reseting = false;
 	mutex_unlock(&rknpu_dev->reset_lock);
+	/* #patch72: promote anything queued while dispatch was disabled -- see rknpu_job_redrive.
+	 * AFTER the unlock: a commit can lead back into a reset, whose mutex_trylock would then fail
+	 * and silently skip a reset that was needed. */
+	rknpu_job_redrive(rknpu_dev);
 	return 0;
 #else
 	return 0;
@@ -240,7 +244,12 @@ int rknpu_soft_reset(struct rknpu_device *rknpu_dev)
 	if (ret) {
 		LOG_DEV_ERROR(rknpu_dev->dev,
 			      "failed to soft reset for rknpu: %d\n", ret);
+		/* #patch72: clear the flag on the way out too. Leaving it set disables dispatch for the
+		 * WHOLE DEVICE permanently -- rknpu_job_next returns immediately for every core -- so a
+		 * failed reset does not degrade the NPU, it silently stops it. */
+		rknpu_dev->soft_reseting = false;
 		mutex_unlock(&rknpu_dev->reset_lock);
+		rknpu_job_redrive(rknpu_dev);
 		return ret;
 	}
 
@@ -272,6 +281,12 @@ int rknpu_soft_reset(struct rknpu_device *rknpu_dev)
 		rknpu_dev->config->state_init(rknpu_dev);
 
 	mutex_unlock(&rknpu_dev->reset_lock);
+
+	/* #patch72: promote anything queued while dispatch was disabled -- see rknpu_job_redrive.
+	 * AFTER state_init, because committing a job before it would program a half-initialised
+	 * block, and after the unlock, because a commit can lead back into rknpu_soft_reset() whose
+	 * mutex_trylock would then fail and silently skip a reset that was needed. */
+	rknpu_job_redrive(rknpu_dev);
 #endif
 
 	return 0;
