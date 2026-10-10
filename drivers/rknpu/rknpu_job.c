@@ -119,6 +119,24 @@ static void rknpu_job_free(struct rknpu_job *job)
 		dma_fence_put(job->fence);
 	}
 
+	/*
+	 * Release the IOMMU domain reference this job still holds.
+	 *
+	 * rknpu_job_schedule() takes one reference per job and records it in
+	 * job->dom_held. Completion (rknpu_job_done), abort (rknpu_job_abort)
+	 * and the reap of the RUNNING job in rknpu_job_timeout_clean() each
+	 * drop it, but the jobs that same reap frees off a core's todo_list do
+	 * not pass through any of them -- they go straight to
+	 * schedule_work(&job->cleanup_work) -- so each one leaked a reference,
+	 * and a leaked reference wedges every later domain switch.
+	 *
+	 * dom_held is per job and this destructor is the one place every
+	 * teardown reaches, so release it here, as the fence rescue above does
+	 * and for the same reason.
+	 */
+	if (test_and_clear_bit(0, &job->dom_held))
+		rknpu_iommu_domain_put(job->rknpu_dev);
+
 	if (job->args_owner)
 		kfree(job->args);
 
